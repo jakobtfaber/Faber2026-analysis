@@ -67,7 +67,7 @@ def _require_sha256(value: Any, label: str) -> str:
 
 
 def _finite_number(value: Any, label: str) -> int | float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         raise ValueError(f"{label} must be numeric")
     if not math.isfinite(float(value)):
         raise ValueError(f"{label} must be finite")
