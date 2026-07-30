@@ -26,6 +26,7 @@ import math
 import multiprocessing
 import re
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal
@@ -44,6 +45,34 @@ _RESPONSE_WEIGHT = np.array([5.0, 8.0, 5.0]) / 18.0
 
 Instrument = Literal["chime", "dsa"]
 Morphology = Literal["gaussian", "scattering"]
+
+
+def _immutable_array(values: NDArray[Any]) -> NDArray[Any]:
+    """Return a bytes-backed array whose writeability cannot be re-enabled."""
+
+    contiguous = np.ascontiguousarray(values)
+    return np.frombuffer(contiguous.tobytes(), dtype=contiguous.dtype).reshape(
+        contiguous.shape
+    )
+
+
+class _FrozenDict(dict[str, str]):
+    """Small picklable immutable mapping for hash-bound provenance."""
+
+    def _immutable(self, *_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("immutable provenance mapping")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable
+
+    def __reduce__(self) -> tuple[type[_FrozenDict], tuple[dict[str, str]]]:
+        return type(self), (dict(self),)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +115,7 @@ class DispersionState:
                 raise ValueError("bounded product DM requires an uncertainty source")
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class BandObservation:
     """One instrument's immutable fitting data on its own native grid."""
 
@@ -100,7 +129,7 @@ class BandObservation:
     time0_unix_ns: int
     reference_frequency_mhz: float
     dispersion: DispersionState
-    input_sha256: dict[str, str] = field(default_factory=dict)
+    input_sha256: Mapping[str, str] = field(default_factory=dict)
     _time_s: NDArray[np.floating] = field(init=False, repr=False)
     _inverse_noise: NDArray[np.floating] = field(init=False, repr=False)
     _whitened_data: NDArray[np.floating] = field(init=False, repr=False)
@@ -115,11 +144,19 @@ class BandObservation:
     _frequency_ratio_1000: NDArray[np.floating] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.waterfall = np.asarray(self.waterfall, dtype=float)
-        self.valid = np.asarray(self.valid, dtype=bool)
-        self.frequency_mhz = np.asarray(self.frequency_mhz, dtype=float)
-        widths = np.asarray(self.channel_width_mhz, dtype=float)
-        noise = np.asarray(self.noise_std, dtype=float)
+        # Own immutable copies. Cached sufficient statistics must never drift
+        # if a caller later mutates the arrays used to construct this object.
+        object.__setattr__(
+            self, "waterfall", np.array(self.waterfall, dtype=float, copy=True)
+        )
+        object.__setattr__(self, "valid", np.array(self.valid, dtype=bool, copy=True))
+        object.__setattr__(
+            self,
+            "frequency_mhz",
+            np.array(self.frequency_mhz, dtype=float, copy=True),
+        )
+        widths = np.array(self.channel_width_mhz, dtype=float, copy=True)
+        noise = np.array(self.noise_std, dtype=float, copy=True)
         if self.instrument not in {"chime", "dsa"}:
             raise ValueError(f"unsupported instrument: {self.instrument!r}")
         if self.waterfall.ndim != 2:
@@ -156,41 +193,99 @@ class BandObservation:
             raise ValueError("valid waterfall pixels must be finite")
         if np.any(~np.isfinite(noise[self.valid])) or np.any(noise[self.valid] <= 0):
             raise ValueError("valid pixels require finite positive noise")
-        self.channel_width_mhz = widths
-        self.noise_std = noise
+        object.__setattr__(self, "channel_width_mhz", widths)
+        object.__setattr__(self, "noise_std", noise)
         # These are the complete parameter-independent sufficient statistics
         # for the one-component Gaussian gain integral. Invalid pixels are
         # represented by exact zeros so every later reduction is branch-free.
         safe_noise = np.where(self.valid, noise, 1.0)
-        self._inverse_noise = np.where(self.valid, 1.0 / safe_noise, 0.0)
-        self._whitened_data = (
-            np.where(self.valid, self.waterfall, 0.0) * self._inverse_noise
+        object.__setattr__(
+            self,
+            "_inverse_noise",
+            np.where(self.valid, 1.0 / safe_noise, 0.0),
         )
-        self._noise_quadratic = np.einsum(
-            "ij,ij->i",
-            self._whitened_data,
-            self._whitened_data,
+        object.__setattr__(
+            self,
+            "_whitened_data",
+            np.where(self.valid, self.waterfall, 0.0) * self._inverse_noise,
         )
-        self._log_normalization = (
+        object.__setattr__(
+            self,
+            "_noise_quadratic",
+            np.einsum("ij,ij->i", self._whitened_data, self._whitened_data),
+        )
+        object.__setattr__(
+            self,
+            "_log_normalization",
             -0.5 * self.valid.sum(axis=1) * math.log(2.0 * math.pi)
-            - np.where(self.valid, np.log(safe_noise), 0.0).sum(axis=1)
+            - np.where(self.valid, np.log(safe_noise), 0.0).sum(axis=1),
         )
-        self._time_s = (
+        object.__setattr__(
+            self,
+            "_time_s",
             np.arange(self.waterfall.shape[1], dtype=float)
-            * float(self.sample_interval_s)
+            * float(self.sample_interval_s),
         )
-        self._evaluation_frequency_mhz = (
-            self.frequency_mhz[:, None]
-            + 0.5 * widths[:, None] * _RESPONSE_NODE
+        object.__setattr__(
+            self,
+            "_evaluation_frequency_mhz",
+            self.frequency_mhz[:, None] + 0.5 * widths[:, None] * _RESPONSE_NODE,
         )
-        self._dispersion_coefficient_s_per_dm = K_DM_S_MHZ2 * (
-            self._evaluation_frequency_mhz**-2
-            - REFERENCE_FREQUENCY_MHZ**-2
+        object.__setattr__(
+            self,
+            "_dispersion_coefficient_s_per_dm",
+            K_DM_S_MHZ2
+            * (self._evaluation_frequency_mhz**-2 - REFERENCE_FREQUENCY_MHZ**-2),
         )
-        self._frequency_ratio_400 = (
-            self._evaluation_frequency_mhz / REFERENCE_FREQUENCY_MHZ
+        object.__setattr__(
+            self,
+            "_frequency_ratio_400",
+            self._evaluation_frequency_mhz / REFERENCE_FREQUENCY_MHZ,
         )
-        self._frequency_ratio_1000 = self._evaluation_frequency_mhz / 1000.0
+        object.__setattr__(
+            self,
+            "_frequency_ratio_1000",
+            self._evaluation_frequency_mhz / 1000.0,
+        )
+        for name in (
+            "waterfall",
+            "valid",
+            "frequency_mhz",
+            "channel_width_mhz",
+            "noise_std",
+            "_time_s",
+            "_inverse_noise",
+            "_whitened_data",
+            "_noise_quadratic",
+            "_log_normalization",
+            "_evaluation_frequency_mhz",
+            "_dispersion_coefficient_s_per_dm",
+            "_frequency_ratio_400",
+            "_frequency_ratio_1000",
+        ):
+            object.__setattr__(self, name, _immutable_array(getattr(self, name)))
+        object.__setattr__(
+            self,
+            "input_sha256",
+            _FrozenDict(self.input_sha256),
+        )
+
+    def __reduce__(self) -> tuple[type[BandObservation], tuple[Any, ...]]:
+        # Reconstruct through __post_init__ in spawned workers. NumPy's default
+        # pickle path otherwise restores owned, writable arrays.
+        return type(self), (
+            self.instrument,
+            self.waterfall,
+            self.valid,
+            self.frequency_mhz,
+            self.channel_width_mhz,
+            self.noise_std,
+            self.sample_interval_s,
+            self.time0_unix_ns,
+            self.reference_frequency_mhz,
+            self.dispersion,
+            dict(self.input_sha256),
+        )
 
     @property
     def time_s(self) -> NDArray[np.floating]:

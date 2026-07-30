@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -172,6 +173,126 @@ def _reconstruction_event(config: dict) -> tuple[dict, dict, dict | None]:
 
 def audit(config: dict) -> dict:
     raw_path = Path(config["raw_dsa_filterbank"])
+    if "accepted_dsa_reference" not in config:
+        reader = Waterfall(str(raw_path), load_data=True)
+        raw = np.asarray(reader.data[:, 0, :], dtype=np.float32).T
+        expected = config["expected_dsa_support"]
+        dead = np.asarray(expected["accepted_dead_channel_ids"], dtype=np.int64)
+        live = np.ones(raw.shape[0], dtype=bool)
+        live[dead] = False
+        mask_sha256 = hashlib.sha256(live.tobytes()).hexdigest()
+        if (
+            raw.shape[0] != int(expected["full_grid_rows"])
+            or int(live.sum()) != int(expected["live_count"])
+            or mask_sha256 != expected["mask_sha256"]
+        ):
+            raise RuntimeError("raw-only DSA support contract changed")
+        crop_start = int(config["raw_dsa_crop_start_sample"])
+        crop_stop = crop_start + int(config["dsa_crop_samples"])
+        if crop_start < 0 or crop_stop > raw.shape[1]:
+            raise RuntimeError("raw-only DSA crop is unavailable")
+        crop = raw[:, crop_start:crop_stop]
+        if not np.all(np.isfinite(crop[live])):
+            raise RuntimeError("raw-only DSA crop contains invalid accepted pixels")
+        noise_stop = int(config["dsa_trigger_search_noise_stop_sample"])
+        if not 0 < noise_stop < crop.shape[1]:
+            raise RuntimeError("raw-only DSA trigger noise window is invalid")
+        live_crop = np.asarray(crop[live], dtype=float)
+        baseline = np.median(live_crop[:, :noise_stop], axis=1)
+        scale = 1.4826 * np.median(
+            np.abs(live_crop[:, :noise_stop] - baseline[:, None]),
+            axis=1,
+        )
+        usable = np.isfinite(scale) & (scale > 0)
+        profile = np.mean(
+            (live_crop[usable] - baseline[usable, None]) / scale[usable, None],
+            axis=0,
+        )
+        trigger_sample = int(np.argmax(profile))
+        if trigger_sample != int(config["dsa_trigger_reference_sample"]):
+            raise RuntimeError("raw-only DSA trigger-reference sample changed")
+        fixture_path = Path(config["reproduction_fixture"])
+        if sha256(fixture_path) != config["expected_reproduction_fixture_sha256"]:
+            raise RuntimeError("DSA timing-semantics fixture SHA-256 mismatch")
+        fixture_rows = json.loads(fixture_path.read_text())["bursts"]
+        fixture = next(
+            (row for row in fixture_rows if row["name"].casefold() == config["event"].casefold()),
+            None,
+        )
+        if fixture is None:
+            raise RuntimeError("DSA timing-semantics fixture lacks this event")
+        fixture_dsa = fixture["dsa"]
+        if not np.isclose(
+            float(fixture_dsa["native_frequency_mhz"]),
+            float(config["dsa_trigger_reference_frequency_mhz"]),
+            rtol=0.0,
+            atol=0.0,
+        ):
+            raise RuntimeError("DSA timing-semantics native frequency changed")
+        frequency = float(reader.header["fch1"]) + float(
+            reader.header["foff"]
+        ) * np.arange(raw.shape[0])
+        if not np.all(np.diff(frequency) < 0):
+            raise RuntimeError("raw DSA frequency order is not authoritative descending order")
+        return {
+            "schema_version": 2,
+            "status": "one_event_raw_filterbank_audit",
+            "event": config["event"],
+            "event_binding_sha256": config["event_binding_sha256"],
+            "raw_filterbank": {
+                "path": str(raw_path),
+                "sha256": sha256(raw_path),
+                "shape": list(raw.shape),
+                "sample_time_s": float(reader.header["tsamp"]),
+            },
+            "accepted_support": {
+                "source": "explicit reviewed channel identifiers",
+                "mask_sha256": mask_sha256,
+                "live_count": int(live.sum()),
+                "dead_count": int((~live).sum()),
+                "dead_channel_ids": dead.tolist(),
+            },
+            "frequency_order": {
+                "raw": "descending",
+                "authority": "filterbank fch1 plus foff",
+            },
+            "row_match": {
+                "reference_frequency_crop_start_sample": float(crop_start),
+                "start_sample_min": crop_start,
+                "start_sample_max": crop_start,
+            },
+            "trigger_reference": {
+                "sample": trigger_sample,
+                "frequency_mhz": float(
+                    config["dsa_trigger_reference_frequency_mhz"]
+                ),
+                "sample_method": "raw accepted-channel median-MAD profile argmax",
+                "time_semantics": config["dsa_trigger_time_semantics"],
+                "time_source": config["dsa_trigger_time_source"],
+                "semantics_fixture": {
+                    "path": str(fixture_path),
+                    "sha256": config["expected_reproduction_fixture_sha256"],
+                    "field": "bursts[].dsa.native_frequency_mhz",
+                    "declared_native_frequency_mhz": float(
+                        fixture_dsa["native_frequency_mhz"]
+                    ),
+                },
+                "noise_stop_sample": noise_stop,
+                "profile_peak_snr": float(profile[trigger_sample]),
+            },
+            "dedispersion_state_fit": {
+                "inferred_reference_minus_raw_dm_pc_cm3": None,
+                "input_total_dm_pc_cm3": float(
+                    config["accepted_dsa_reference_dm_pc_cm3"]
+                ),
+                "source": config["dsa_product_dm_state_source"],
+                "raw_bytes_establish_product_dm": False,
+                "claim": (
+                    "owner-supplied product-state coordinate; the raw audit does "
+                    "not independently infer dispersion measure"
+                ),
+            },
+        }
     reference_path = Path(config["accepted_dsa_reference"])
     reader = Waterfall(str(raw_path), load_data=True)
     raw = np.asarray(reader.data[:, 0, :], dtype=np.float32).T

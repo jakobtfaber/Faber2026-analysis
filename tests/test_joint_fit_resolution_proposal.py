@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -51,14 +53,17 @@ def test_residual_smearing_uses_absolute_and_product_dm_endpoint_hull() -> None:
 
 def test_residual_smearing_includes_uncertain_product_dm_endpoints() -> None:
     source = observation()
-    source.dispersion = DispersionState(
-        input_dm_pc_cm3=100.0,
-        coherent_correction_pc_cm3=0.0,
-        incoherent_correction_pc_cm3=0.0,
-        product_dm_pc_cm3=100.0,
-        mode="inferred_raw_input",
-        product_dm_bounds_pc_cm3=(99.7, 100.2),
-        product_dm_bound_source="injected",
+    source = replace(
+        source,
+        dispersion=DispersionState(
+            input_dm_pc_cm3=100.0,
+            coherent_correction_pc_cm3=0.0,
+            incoherent_correction_pc_cm3=0.0,
+            product_dm_pc_cm3=100.0,
+            mode="inferred_raw_input",
+            product_dm_bounds_pc_cm3=(99.7, 100.2),
+            product_dm_bound_source="injected",
+        ),
     )
     result = residual_smearing_calculation(
         source,

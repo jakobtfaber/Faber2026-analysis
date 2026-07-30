@@ -684,16 +684,34 @@ def validate_config(
         isinstance(config.get("workflow"), dict)
         and config["workflow"].get("regression_fixture") is True
     )
+    raw_only = config.get("workflow", {}).get("observation_source") == (
+        "raw_instrument_products_only"
+    )
     paths = config["paths"]
+    if raw_only:
+        forbidden_archival_keys = {
+            "accepted_chime_reference",
+            "accepted_dsa_reference",
+        }
+        for label, values in (
+            ("paths", paths),
+            ("identity.input_basenames", identity["input_basenames"]),
+            ("input_sha256", config["input_sha256"]),
+        ):
+            present = sorted(forbidden_archival_keys.intersection(values))
+            if present:
+                raise ValueError(
+                    f"{label}: raw-only workflow forbids archival intensity inputs {present}"
+                )
     input_keys = (
         "raw_chime_h5",
-        "accepted_chime_reference",
         "raw_dsa_filterbank",
-        "accepted_dsa_reference",
         "timing_results",
         "trigger_recovery",
         "reproduction_fixture",
     )
+    if not raw_only:
+        input_keys += ("accepted_chime_reference", "accepted_dsa_reference")
     if not is_regression_fixture:
         input_keys += ("dsa_state_reconstruction",)
         if (
@@ -732,9 +750,7 @@ def validate_config(
             raise ValueError(f"cross-event path token rejected for {event!r}: {conflicts}")
     for key in (
         "raw_chime_h5",
-        "accepted_chime_reference",
         "raw_dsa_filterbank",
-        "accepted_dsa_reference",
         "output_root",
     ):
         if not _path_mentions_event(paths[key], event):
@@ -807,6 +823,12 @@ def validate_config(
         raise ValueError("manual CHIME masks are not authorized by this workflow")
     if support["historical_row_sum_replay"] is not False:
         raise ValueError("historical CHIME row-sum replay must remain disabled")
+    if raw_only:
+        _require_keys(support, ("mask_sha256",), "chime.accepted_support")
+        _require_sha256(
+            support["mask_sha256"],
+            "chime.accepted_support.mask_sha256",
+        )
 
     grid = chime["grid"]
     _require_keys(
@@ -857,6 +879,52 @@ def validate_config(
         raise ValueError("dsa.raw_crop_start_sample must be non-negative")
     if int(dsa["crop_samples"]) <= 0 or int(dsa["padding_samples"]) <= 0:
         raise ValueError("DSA crop and padding samples must be positive")
+    if raw_only:
+        _require_keys(
+            dsa,
+            (
+                "trigger_reference_sample",
+                "trigger_reference_frequency_mhz",
+                "trigger_search_noise_stop_sample",
+            ),
+            "dsa",
+        )
+        if not 0 <= int(dsa["trigger_reference_sample"]) < int(dsa["crop_samples"]):
+            raise ValueError("DSA trigger-reference sample lies outside crop")
+        if not math.isclose(
+            float(dsa["trigger_reference_frequency_mhz"]),
+            float(config["geometry"]["dsa_native_frequency_mhz"]),
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            raise ValueError("DSA trigger reference must equal native frequency")
+    dsa_support = dsa["accepted_support"]
+    dead_ids = dsa_support.get("accepted_dead_channel_ids")
+    if raw_only:
+        _require_keys(
+            dsa_support,
+            ("accepted_dead_channel_ids", "mask_sha256"),
+            "dsa.accepted_support",
+        )
+    if dead_ids is not None and (
+        not isinstance(dead_ids, list)
+        or dead_ids != sorted(set(dead_ids))
+        or len(dead_ids) != int(dsa_support["dead_count"])
+        or any(
+            not isinstance(row, int)
+            or row < 0
+            or row >= int(dsa_support["full_grid_rows"])
+            for row in dead_ids
+        )
+    ):
+        raise ValueError("DSA accepted-dead channel IDs must be exact sorted unique IDs")
+    if (
+        int(dsa_support["live_count"]) + int(dsa_support["dead_count"])
+        != int(dsa_support["full_grid_rows"])
+    ):
+        raise ValueError("DSA support does not partition the full grid")
+    if "mask_sha256" in dsa_support:
+        _require_sha256(dsa_support["mask_sha256"], "dsa.accepted_support.mask_sha256")
     if not is_regression_fixture:
         _require_keys(
             dsa,
@@ -1179,6 +1247,11 @@ def validate_config(
         ),
         "workflow",
     )
+    if workflow.get("observation_source", "legacy_archival_reference") not in {
+        "raw_instrument_products_only",
+        "legacy_archival_reference",
+    }:
+        raise ValueError("workflow.observation_source is invalid")
     legacy_stages = [
         "preflight",
         "dsa_audit",
@@ -1355,16 +1428,18 @@ def legacy_stage_config(config: dict[str, Any]) -> dict[str, Any]:
     grid = chime["grid"]
     gates = chime["gates"]
     is_regression_fixture = config["workflow"]["regression_fixture"] is True
-    return {
+    stage = {
         "schema_version": config["schema_version"],
         "event": config["event"],
         "burst": config["event"],
         "result_status": config["result_status"],
         "event_binding_sha256": config["event_binding_sha256"],
+        "observation_source": config["workflow"].get(
+            "observation_source",
+            "legacy_archival_reference",
+        ),
         "h5_path": paths["raw_chime_h5"],
-        "accepted_chime_reference": paths["accepted_chime_reference"],
         "expected_h5_sha256": hashes["raw_chime_h5"],
-        "expected_chime_reference_sha256": hashes["accepted_chime_reference"],
         "accepted_chime_reference_dm_pc_cm3": chime["accepted_reference_dm_pc_cm3"],
         "anchor_dm_pc_cm3": chime["anchor_dm_pc_cm3"],
         "upchannel_factor": chime["upchannel_factor"],
@@ -1387,10 +1462,9 @@ def legacy_stage_config(config: dict[str, Any]) -> dict[str, Any]:
         "expected_chime_support": chime["accepted_support"],
         "geometry_dm_pc_cm3": config["geometry"]["geometry_dm_pc_cm3"],
         "raw_dsa_filterbank": paths["raw_dsa_filterbank"],
-        "accepted_dsa_reference": paths["accepted_dsa_reference"],
         "expected_dsa_raw_sha256": hashes["raw_dsa_filterbank"],
-        "expected_dsa_reference_sha256": hashes["accepted_dsa_reference"],
         "accepted_dsa_reference_dm_pc_cm3": dsa["accepted_reference_dm_pc_cm3"],
+        "dsa_product_dm_state_source": dsa.get("product_dm_state_source"),
         "raw_dsa_crop_start_sample": dsa["raw_crop_start_sample"],
         "dsa_crop_samples": dsa["crop_samples"],
         "dsa_padding_samples": dsa["padding_samples"],
@@ -1399,6 +1473,21 @@ def legacy_stage_config(config: dict[str, Any]) -> dict[str, Any]:
         "dsa_gates": dsa["gates"],
         "reference_frequency_mhz": config["geometry"]["reference_frequency_mhz"],
         "dsa_native_frequency_mhz": config["geometry"]["dsa_native_frequency_mhz"],
+        "trigger_recovery": paths["trigger_recovery"],
+        "expected_trigger_recovery_sha256": hashes["trigger_recovery"],
+        "timing_results": paths["timing_results"],
+        "expected_timing_results_sha256": hashes["timing_results"],
+        "reproduction_fixture": paths["reproduction_fixture"],
+        "expected_reproduction_fixture_sha256": hashes["reproduction_fixture"],
+        "dsa_trigger_reference_sample": dsa.get("trigger_reference_sample"),
+        "dsa_trigger_reference_frequency_mhz": dsa.get(
+            "trigger_reference_frequency_mhz"
+        ),
+        "dsa_trigger_time_semantics": dsa.get("trigger_time_semantics"),
+        "dsa_trigger_time_source": dsa.get("trigger_time_source"),
+        "dsa_trigger_search_noise_stop_sample": dsa.get(
+            "trigger_search_noise_stop_sample"
+        ),
         **(
             {
                 "dsa_state_reconstruction": paths["dsa_state_reconstruction"],
@@ -1428,3 +1517,15 @@ def legacy_stage_config(config: dict[str, Any]) -> dict[str, Any]:
             else {}
         ),
     }
+    if config["workflow"].get("observation_source") != "raw_instrument_products_only":
+        stage.update(
+            {
+                "accepted_chime_reference": paths["accepted_chime_reference"],
+                "expected_chime_reference_sha256": hashes[
+                    "accepted_chime_reference"
+                ],
+                "accepted_dsa_reference": paths["accepted_dsa_reference"],
+                "expected_dsa_reference_sha256": hashes["accepted_dsa_reference"],
+            }
+        )
+    return stage

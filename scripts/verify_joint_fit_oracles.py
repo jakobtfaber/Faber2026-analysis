@@ -353,8 +353,15 @@ def verify(
         raise RuntimeError("CHIME non-wrapping processing identity is absent")
     expected_chime_hashes = {
         "raw_chime_h5": config["input_sha256"]["raw_chime_h5"],
-        "accepted_chime_reference": config["input_sha256"]["accepted_chime_reference"],
+        "accepted_chime_support": config["chime"]["accepted_support"]["mask_sha256"],
     }
+    if config["workflow"].get("observation_source") != "raw_instrument_products_only":
+        expected_chime_hashes = {
+            "raw_chime_h5": config["input_sha256"]["raw_chime_h5"],
+            "accepted_chime_reference": config["input_sha256"][
+                "accepted_chime_reference"
+            ],
+        }
     chime_anchor = load_band_observation_product(chime_observation_path)
     if (
         chime_anchor.instrument != "chime"
@@ -494,8 +501,15 @@ def verify(
         raise RuntimeError("DSA non-wrapping processing identity is absent")
     expected_dsa_hashes = {
         "raw_dsa_filterbank": config["input_sha256"]["raw_dsa_filterbank"],
-        "accepted_dsa_reference": config["input_sha256"]["accepted_dsa_reference"],
+        "accepted_dsa_support": config["dsa"]["accepted_support"]["mask_sha256"],
     }
+    if config["workflow"].get("observation_source") != "raw_instrument_products_only":
+        expected_dsa_hashes = {
+            "raw_dsa_filterbank": config["input_sha256"]["raw_dsa_filterbank"],
+            "accepted_dsa_reference": config["input_sha256"][
+                "accepted_dsa_reference"
+            ],
+        }
     dsa_anchor = load_band_observation_product(dsa_observation_path)
     if (
         dsa_anchor.instrument != "dsa"

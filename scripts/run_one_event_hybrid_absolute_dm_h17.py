@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import warnings
 from pathlib import Path
@@ -51,9 +52,34 @@ from radio_pipeline.fitting.products import (
 
 
 def _accepted_support(
+    expected: dict[str, Any],
+    frequency_id: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Materialize the reviewed mask without loading an archival intensity array."""
+
+    full_grid_rows = int(expected["full_grid_rows"])
+    live = np.zeros(full_grid_rows, dtype=bool)
+    present = np.asarray(frequency_id, dtype=np.int64)
+    present_dead = np.asarray(
+        expected["h5_present_accepted_dead_ids"],
+        dtype=np.int64,
+    )
+    live[np.setdiff1d(present, present_dead)] = True
+    if (
+        present.size != int(expected["h5_present_count"])
+        or int(live.sum()) != int(expected["live_count"])
+        or hashlib.sha256(live.tobytes()).hexdigest() != expected["mask_sha256"]
+    ):
+        raise RuntimeError("configured CHIME support is internally inconsistent")
+    return {"live": live}
+
+
+def _legacy_accepted_support(
     reference: np.ndarray,
     expected: dict[str, Any],
 ) -> dict[str, np.ndarray]:
+    """Compatibility-only mask recovered from an archival intensity product."""
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         standard_deviation = np.nanstd(reference, axis=1)
@@ -66,7 +92,7 @@ def _accepted_support(
         or int(finite_flat.sum()) != int(expected["finite_flat_count"])
         or int(live.sum()) != int(expected["live_count"])
     ):
-        raise RuntimeError("accepted CHIME support changed")
+        raise RuntimeError("legacy accepted CHIME support changed")
     return {"all_nan": all_nan, "finite_flat": finite_flat, "live": live}
 
 
@@ -304,16 +330,18 @@ def run(
 ) -> dict:
     event = config["event"]
     h5_path = Path(config["h5_path"])
-    reference_path = Path(config["accepted_chime_reference"])
     expected_h5_sha256 = config["expected_h5_sha256"]
-    expected_reference_sha256 = config["expected_chime_reference_sha256"]
     if sha256(h5_path) != expected_h5_sha256:
         raise RuntimeError("raw CHIME H5 SHA-256 mismatch")
-    if sha256(reference_path) != expected_reference_sha256:
-        raise RuntimeError("accepted CHIME reference SHA-256 mismatch")
-    reference = np.load(reference_path)
     expected_support = config["expected_chime_support"]
-    support = _accepted_support(reference, expected_support)
+    raw_only = config.get("observation_source") == "raw_instrument_products_only"
+    legacy_reference = None
+    if not raw_only:
+        reference_path = Path(config["accepted_chime_reference"])
+        expected_reference_sha256 = config["expected_chime_reference_sha256"]
+        if sha256(reference_path) != expected_reference_sha256:
+            raise RuntimeError("legacy accepted CHIME reference SHA-256 mismatch")
+        legacy_reference = np.load(reference_path)
 
     data = BBData.from_file(str(h5_path))
     raw_voltage = np.asarray(data["tiedbeam_baseband"][:])
@@ -331,6 +359,11 @@ def run(
         )
         embedded_sha = str(handle.attrs["baseband-analysis_git_sha"])
     validate_frequency_map(frequency_id, frequency_mhz, raw_voltage.shape[0])
+    support = (
+        _accepted_support(expected_support, frequency_id)
+        if raw_only
+        else _legacy_accepted_support(legacy_reference, expected_support)
+    )
     input_coordinate_dm = physical_dm_from_package_coordinate(
         package_input_dm,
         package_dispersion_constant=PACKAGE_K_DM_S_MHZ2,
@@ -434,10 +467,13 @@ def run(
         )
     )
     fine_channel_width_mhz = coarse_width_mhz / upchannel_factor
-    input_hashes = {
-        "raw_chime_h5": expected_h5_sha256,
-        "accepted_chime_reference": expected_reference_sha256,
-    }
+    input_hashes = {"raw_chime_h5": expected_h5_sha256}
+    if raw_only:
+        input_hashes["accepted_chime_support"] = expected_support["mask_sha256"]
+    else:
+        input_hashes["accepted_chime_reference"] = config[
+            "expected_chime_reference_sha256"
+        ]
     del anchor_aligned
     gc.collect()
     if not np.all(np.isfinite(anchor_source[upchannel["accepted_live"]])):
@@ -583,10 +619,28 @@ def run(
             "scope": f"{event} reviewed-input preparation only",
             "preparation_only": True,
             "source_h5": {"path": str(h5_path), "sha256": expected_h5_sha256},
-            "accepted_reference": {
-                "path": str(reference_path),
-                "sha256": expected_reference_sha256,
-                "dm_pc_cm3": float(config["accepted_chime_reference_dm_pc_cm3"]),
+            "accepted_support": {
+                "source": (
+                    "explicit reviewed H5-present dead channel identifiers"
+                    if raw_only
+                    else "compatibility-only archival accepted reference"
+                ),
+                **(
+                    {
+                        "mask_sha256": hashlib.sha256(
+                            support["live"].tobytes()
+                        ).hexdigest()
+                    }
+                    if raw_only
+                    else {
+                        "reference_sha256": config[
+                            "expected_chime_reference_sha256"
+                        ],
+                        "derived_mask_sha256": hashlib.sha256(
+                            support["live"].tobytes()
+                        ).hexdigest(),
+                    }
+                ),
             },
             "support": {
                 "full_grid_rows": full_grid_rows,
@@ -807,10 +861,28 @@ def run(
         "embedded_producer_sha": embedded_sha,
         "baseband_dm_attribute_present": baseband_dm_present,
         "physical_input_state_status": "pending independent review",
-        "accepted_reference": {
-            "path": str(reference_path),
-            "sha256": expected_reference_sha256,
-            "dm_pc_cm3": float(config["accepted_chime_reference_dm_pc_cm3"]),
+        "accepted_support": {
+            "source": (
+                "explicit reviewed H5-present dead channel identifiers"
+                if raw_only
+                else "compatibility-only archival accepted reference"
+            ),
+            **(
+                {
+                    "mask_sha256": hashlib.sha256(
+                        support["live"].tobytes()
+                    ).hexdigest()
+                }
+                if raw_only
+                else {
+                    "reference_sha256": config[
+                        "expected_chime_reference_sha256"
+                    ],
+                    "derived_mask_sha256": hashlib.sha256(
+                        support["live"].tobytes()
+                    ).hexdigest(),
+                }
+            ),
         },
         "support": {
             "full_grid_rows": full_grid_rows,
@@ -921,11 +993,15 @@ def main() -> None:
         verification_dms_pc_cm3=verification_dms,
         preparation_only=args.preparation_only,
     )
-    fit = result["grid"]["fit"]
-    print(
-        f"{result['burst']} hybrid: {fit['dm_pc_cm3']:.6f} +/- {fit['sigma_pc_cm3']:.6f} pc cm^-3",
-        flush=True,
-    )
+    if args.preparation_only:
+        print(f"{result['burst']} raw-H5 preparation complete", flush=True)
+    else:
+        fit = result["grid"]["fit"]
+        print(
+            f"{result['burst']} hybrid: "
+            f"{fit['dm_pc_cm3']:.6f} +/- {fit['sigma_pc_cm3']:.6f} pc cm^-3",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

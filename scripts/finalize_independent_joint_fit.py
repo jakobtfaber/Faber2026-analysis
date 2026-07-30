@@ -19,7 +19,7 @@ def main() -> None:
     parser.add_argument("--geometry-constraint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
-    config = load_config(args.config)
+    config = load_config(args.config, require_execution_authorized=True)
     config["_config_path"] = str(args.config.resolve())
     config["paths"]["output_root"] = str(args.output_dir)
     result = run(

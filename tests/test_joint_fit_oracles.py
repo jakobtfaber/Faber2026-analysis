@@ -100,7 +100,7 @@ def _fixture(tmp_path):
             ),
             input_sha256={
                 "raw_chime_h5": "c" * 64,
-                "accepted_chime_reference": "d" * 64,
+                "accepted_chime_support": "d" * 64,
             },
             extra={
                 "fine_frequency_id": frequency_id,
@@ -190,7 +190,7 @@ def _fixture(tmp_path):
             ),
             input_sha256={
                 "raw_dsa_filterbank": "b" * 64,
-                "accepted_dsa_reference": "e" * 64,
+                "accepted_dsa_support": "e" * 64,
             },
         )
         products[f"posterior_{label}"] = {
@@ -211,16 +211,21 @@ def _fixture(tmp_path):
     config = {
         "event": event,
         "event_binding_sha256": binding,
+        "workflow": {"observation_source": "raw_instrument_products_only"},
         "chime": {
+            "accepted_support": {"mask_sha256": "d" * 64},
             "gates": {
                 "oracle_normalised_curve_max_abs_difference": 0.1,
             }
         },
+        "dsa": {
+            "accepted_support": {"mask_sha256": "e" * 64},
+        },
         "input_sha256": {
             "raw_chime_h5": "c" * 64,
-            "accepted_chime_reference": "d" * 64,
+            "accepted_chime_support": "d" * 64,
             "raw_dsa_filterbank": "b" * 64,
-            "accepted_dsa_reference": "e" * 64,
+            "accepted_dsa_support": "e" * 64,
         },
     }
     posterior_path = tmp_path / "posterior.npz"

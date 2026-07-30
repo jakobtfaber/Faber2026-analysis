@@ -26,7 +26,7 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     args = parser.parse_args()
-    config = load_config(args.config)
+    config = load_config(args.config, require_execution_authorized=True)
     request = _request(
         config,
         args.chime_observation,

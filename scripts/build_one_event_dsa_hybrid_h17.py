@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import warnings
 from pathlib import Path
@@ -97,14 +98,58 @@ def reference_frequency_time0_unix_ns(
 ) -> int:
     """Translate a native-band timestamp to the target's 400 MHz epoch."""
 
-    delay_s = K_DM_S_MHZ2 * (
-        float(target_dm_pc_cm3) * REFERENCE_FREQUENCY_MHZ**-2
-        - float(input_dm_pc_cm3) * float(native_reference_frequency_mhz) ** -2
+    if not np.isfinite(input_dm_pc_cm3):
+        raise ValueError("input DM must be finite")
+    # The timestamp is attached to the native reference-frequency coordinate.
+    # Changing the product DM alters pixel placement, not that physical epoch.
+    delay_s = K_DM_S_MHZ2 * float(target_dm_pc_cm3) * (
+        REFERENCE_FREQUENCY_MHZ**-2
+        - float(native_reference_frequency_mhz) ** -2
     )
     return int(native_time0_unix_ns) + round(delay_s * 1.0e9)
 
 
-def _accepted_support(reference: np.ndarray, expected: dict) -> np.ndarray:
+def trigger_referenced_crop_time0_unix_ns(
+    trigger_mjd: object,
+    *,
+    trigger_sample: int,
+    sample_time_s: float,
+    input_dm_pc_cm3: float,
+    target_dm_pc_cm3: float,
+    native_reference_frequency_mhz: float,
+) -> int:
+    """Refer a raw crop to 400 MHz using its search-trigger sample."""
+
+    native_crop_time0 = mjd_crop_time0_unix_ns(
+        trigger_mjd,
+        -int(trigger_sample),
+        sample_time_s,
+    )
+    return reference_frequency_time0_unix_ns(
+        native_crop_time0,
+        input_dm_pc_cm3=input_dm_pc_cm3,
+        target_dm_pc_cm3=target_dm_pc_cm3,
+        native_reference_frequency_mhz=native_reference_frequency_mhz,
+    )
+
+
+def _accepted_support(expected: dict) -> np.ndarray:
+    """Materialize the reviewed mask without loading an archival intensity array."""
+
+    live = np.ones(int(expected["full_grid_rows"]), dtype=bool)
+    dead = np.asarray(expected["accepted_dead_channel_ids"], dtype=np.int64)
+    live[dead] = False
+    if (
+        int(live.sum()) != int(expected["live_count"])
+        or hashlib.sha256(live.tobytes()).hexdigest() != expected["mask_sha256"]
+    ):
+        raise RuntimeError("configured DSA support is internally inconsistent")
+    return live
+
+
+def _legacy_accepted_support(reference: np.ndarray, expected: dict) -> np.ndarray:
+    """Recover the compatibility-only mask from its archival intensity product."""
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         standard_deviation = np.nanstd(reference, axis=1)
@@ -114,7 +159,7 @@ def _accepted_support(reference: np.ndarray, expected: dict) -> np.ndarray:
         or int(live.sum()) != int(expected["live_count"])
         or int((~live).sum()) != int(expected["dead_count"])
     ):
-        raise RuntimeError("accepted DSA support changed")
+        raise RuntimeError("legacy accepted DSA support changed")
     return live
 
 
@@ -342,35 +387,50 @@ def run(
     if chime_result["status"] != expected_status:
         raise RuntimeError("DSA products require the matching CHIME result")
     raw_path = Path(config["raw_dsa_filterbank"])
-    reference_path = Path(config["accepted_dsa_reference"])
     expected_raw_sha256 = config["expected_dsa_raw_sha256"]
-    expected_reference_sha256 = config["expected_dsa_reference_sha256"]
     if sha256(raw_path) != expected_raw_sha256:
         raise RuntimeError("raw DSA filterbank SHA-256 mismatch")
-    if sha256(reference_path) != expected_reference_sha256:
-        raise RuntimeError("accepted DSA reference SHA-256 mismatch")
     if dsa_audit.get("event") != event:
         raise RuntimeError("DSA audit event does not match configuration")
     if dsa_audit.get("event_binding_sha256") != config["event_binding_sha256"]:
         raise RuntimeError("DSA audit binding does not match configuration")
     if dsa_audit["raw_filterbank"]["sha256"] != expected_raw_sha256:
         raise RuntimeError("DSA audit refers to another raw filterbank")
-    if dsa_audit["accepted_reference"]["sha256"] != expected_reference_sha256:
-        raise RuntimeError("DSA audit refers to another accepted reference")
     frequency_order = dsa_audit["frequency_order"]
-    direct_correlation = float(frequency_order["direct_median_correlation"])
-    reversed_correlation = float(frequency_order["reversed_median_correlation"])
     gates = config["dsa_gates"]
-    if (
-        direct_correlation < float(gates["direct_correlation_min"])
-        or reversed_correlation > float(gates["reversed_correlation_max"])
-        or direct_correlation <= reversed_correlation
-    ):
-        raise RuntimeError("DSA direct-frequency-order oracle failed")
+    raw_only = config.get("observation_source") == "raw_instrument_products_only"
+    expected_audit_status = (
+        "one_event_raw_filterbank_audit"
+        if raw_only
+        else "one_event_dsa_input_state_audit"
+    )
+    if dsa_audit.get("status") != expected_audit_status:
+        raise RuntimeError("DSA audit mode contradicts canonical observation source")
+    if raw_only:
+        if frequency_order.get("raw") != "descending":
+            raise RuntimeError("DSA authoritative raw frequency order changed")
+    else:
+        direct_correlation = float(frequency_order["direct_median_correlation"])
+        reversed_correlation = float(frequency_order["reversed_median_correlation"])
+        if (
+            direct_correlation < float(gates["direct_correlation_min"])
+            or reversed_correlation > float(gates["reversed_correlation_max"])
+            or direct_correlation <= reversed_correlation
+        ):
+            raise RuntimeError("DSA direct-frequency-order oracle failed")
     state = dsa_audit["dedispersion_state_fit"]
     row_match = dsa_audit["row_match"]
     uncertainty_mode = "input_dsa_dm_method" in config
-    if uncertainty_mode:
+    if raw_only:
+        crop_start = int(config["raw_dsa_crop_start_sample"])
+        if (
+            int(row_match["start_sample_min"]) != crop_start
+            or int(row_match["start_sample_max"]) != crop_start
+        ):
+            raise RuntimeError("DSA raw-only crop start changed")
+        if state["inferred_reference_minus_raw_dm_pc_cm3"] is not None:
+            raise RuntimeError("raw-only audit must not claim an inferred product DM")
+    elif uncertainty_mode:
         audit_contract = dsa_audit.get("input_state_contract", {})
         for key, expected in (
             ("method", config["input_dsa_dm_method"]),
@@ -418,8 +478,24 @@ def run(
 
     reader = Waterfall(str(raw_path), load_data=True)
     raw = np.asarray(reader.data[:, 0, :], dtype=np.float32).T
-    reference = np.load(reference_path)
-    accepted_live = _accepted_support(reference, config["expected_dsa_support"])
+    accepted_reference = None
+    if raw_only:
+        accepted_live = _accepted_support(config["expected_dsa_support"])
+    else:
+        reference_path = Path(config["accepted_dsa_reference"])
+        expected_reference_sha256 = config["expected_dsa_reference_sha256"]
+        if sha256(reference_path) != expected_reference_sha256:
+            raise RuntimeError("legacy accepted DSA reference SHA-256 mismatch")
+        if (
+            dsa_audit.get("accepted_reference", {}).get("sha256")
+            != expected_reference_sha256
+        ):
+            raise RuntimeError("DSA audit refers to another accepted reference")
+        accepted_reference = np.load(reference_path)
+        accepted_live = _legacy_accepted_support(
+            accepted_reference,
+            config["expected_dsa_support"],
+        )
     sample_time_s = float(reader.header["tsamp"])
     if (
         uncertainty_mode
@@ -429,18 +505,61 @@ def run(
     frequency_mhz = float(reader.header["fch1"]) + float(reader.header["foff"]) * np.arange(
         int(reader.header["nchans"])
     )
-    if "tstart" not in reader.header:
-        raise RuntimeError("DSA filterbank lacks an authoritative MJD time origin")
-    native_time0_unix_ns = mjd_crop_time0_unix_ns(
-        reader.header["tstart"],
-        crop_start,
-        sample_time_s,
-    )
+    if raw_only:
+        trigger_path = Path(config["trigger_recovery"])
+        if sha256(trigger_path) != config["expected_trigger_recovery_sha256"]:
+            raise RuntimeError("DSA trigger-recovery SHA-256 mismatch")
+        trigger = json.loads(trigger_path.read_text()).get(event)
+        if not isinstance(trigger, dict) or trigger.get("status") != "VERIFIED":
+            raise RuntimeError("DSA trigger recovery lacks one verified event")
+        fixture_path = Path(config["reproduction_fixture"])
+        if sha256(fixture_path) != config["expected_reproduction_fixture_sha256"]:
+            raise RuntimeError("DSA timing-semantics fixture SHA-256 mismatch")
+        fixture_rows = json.loads(fixture_path.read_text())["bursts"]
+        fixture = next(
+            (row for row in fixture_rows if row["name"].casefold() == event.casefold()),
+            None,
+        )
+        if fixture is None:
+            raise RuntimeError("DSA timing-semantics fixture lacks this event")
+        if not np.isclose(
+            float(fixture["dsa"]["native_frequency_mhz"]),
+            float(config["dsa_trigger_reference_frequency_mhz"]),
+            rtol=0.0,
+            atol=0.0,
+        ):
+            raise RuntimeError("DSA timing-semantics native frequency changed")
+        trigger_sample = int(config["dsa_trigger_reference_sample"])
+        if not 0 <= trigger_sample < int(config["dsa_crop_samples"]):
+            raise RuntimeError("DSA trigger-reference sample lies outside crop")
+        if not np.isclose(
+            float(config["dsa_trigger_reference_frequency_mhz"]),
+            float(config["dsa_native_frequency_mhz"]),
+            rtol=0.0,
+            atol=0.0,
+        ):
+            raise RuntimeError("DSA trigger and native reference frequencies differ")
+        native_time0_unix_ns = mjd_crop_time0_unix_ns(
+            trigger["mjd_trigger_exact"], -trigger_sample, sample_time_s
+        )
+    else:
+        if "tstart" not in reader.header:
+            raise RuntimeError("DSA filterbank lacks an authoritative MJD time origin")
+        native_time0_unix_ns = mjd_crop_time0_unix_ns(
+            reader.header["tstart"],
+            crop_start,
+            sample_time_s,
+        )
     channel_width_mhz = abs(float(reader.header["foff"]))
-    input_hashes = {
-        "raw_dsa_filterbank": expected_raw_sha256,
-        "accepted_dsa_reference": expected_reference_sha256,
-    }
+    input_hashes = {"raw_dsa_filterbank": expected_raw_sha256}
+    if raw_only:
+        input_hashes["accepted_dsa_support"] = config["expected_dsa_support"][
+            "mask_sha256"
+        ]
+    else:
+        input_hashes["accepted_dsa_reference"] = config[
+            "expected_dsa_reference_sha256"
+        ]
     input_dm = float(
         config["input_dsa_dm_pc_cm3"]
         if uncertainty_mode
@@ -448,8 +567,6 @@ def run(
     )
     native_reference_frequency_mhz = float(config["dsa_native_frequency_mhz"])
     window = int(config["dsa_crop_samples"])
-    if reference.shape[1] != window:
-        raise RuntimeError("accepted DSA crop length changed")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     products = {}
@@ -467,7 +584,7 @@ def run(
         source_start = crop_start - padding
         source_stop = crop_start + window + padding
         source = np.asarray(raw[:, source_start:source_stop], dtype=float)
-        if source.shape != (reference.shape[0], window + 2 * padding):
+        if source.shape != (raw.shape[0], window + 2 * padding):
             raise RuntimeError("DSA padded source crop is incomplete")
         raw_reference_crop = source[:, padding : padding + window]
     if not np.all(np.isfinite(raw_reference_crop[accepted_live])):
@@ -490,24 +607,46 @@ def run(
         channel_width_mhz=channel_width_mhz,
         input_sha256=input_hashes,
     )
+    accepted_dm = float(config["accepted_dsa_reference_dm_pc_cm3"])
+    if raw_only:
+        accepted_reference_crop = (
+            raw_reference_crop
+            if np.isclose(accepted_dm, input_dm, rtol=0.0, atol=1.0e-12)
+            else apply_residual_dm_absolute_crop(
+                raw,
+                frequency_mhz,
+                sample_time_s,
+                accepted_dm - input_dm,
+                crop_start,
+                window,
+            )
+        )
+    else:
+        if accepted_reference is None:
+            raise RuntimeError("legacy accepted reference was not loaded")
+        accepted_reference_crop = np.asarray(accepted_reference, dtype=float)
     products["accepted_reference_dm"] = _write_product(
         output_dir / "dsa_accepted_reference_dm.npz",
-        waterfall=reference,
+        waterfall=accepted_reference_crop,
         frequency_mhz=frequency_mhz,
         accepted_live=accepted_live,
         sample_time_s=sample_time_s,
-        target_dm=float(config["accepted_dsa_reference_dm_pc_cm3"]),
+        target_dm=accepted_dm,
         input_dm=input_dm,
         source_start_sample=crop_start,
         time0_unix_ns=reference_frequency_time0_unix_ns(
             native_time0_unix_ns,
             input_dm_pc_cm3=input_dm,
-            target_dm_pc_cm3=float(config["accepted_dsa_reference_dm_pc_cm3"]),
+            target_dm_pc_cm3=accepted_dm,
             native_reference_frequency_mhz=native_reference_frequency_mhz,
         ),
         channel_width_mhz=channel_width_mhz,
         input_sha256=input_hashes,
-        input_assumption="external_accepted_reference",
+        input_assumption=(
+            "fresh_raw_filterbank_crop"
+            if raw_only
+            else "external_accepted_reference"
+        ),
     )
     if verification_dms_pc_cm3 is None:
         targets = {
@@ -703,25 +842,37 @@ def run(
             "sample_time_s": sample_time_s,
             "reference_frequency_crop_start_sample": crop_start,
         },
-        "accepted_reference": {
-            "path": str(reference_path),
-            "sha256": expected_reference_sha256,
-            "shape": list(reference.shape),
+        "accepted_support": {
+            "source": (
+                "explicit reviewed channel identifiers in canonical configuration"
+                if raw_only
+                else "compatibility-only archival accepted reference"
+            ),
+            "mask_sha256": (
+                config["expected_dsa_support"]["mask_sha256"]
+                if raw_only
+                else None
+            ),
+            "reference_sha256": (
+                None
+                if raw_only
+                else config["expected_dsa_reference_sha256"]
+            ),
+            "shape": [int(raw.shape[0])],
             "dm_pc_cm3": float(config["accepted_dsa_reference_dm_pc_cm3"]),
             "live_row_count": int(accepted_live.sum()),
             "dead_row_count": int((~accepted_live).sum()),
-            "raw_crop_profile_correlation": _profile_correlation(
-                raw_reference_crop,
-                reference,
-                accepted_live,
-            ),
         },
         "input_state": {
             "nominal_input_total_dm_pc_cm3": input_dm,
             "input_dm_method": (
                 config["input_dsa_dm_method"]
                 if uncertainty_mode
-                else "header_independent_legacy_exact_crop_audit"
+                else (
+                    "owner_confirmed_filterbank_product_dm"
+                    if raw_only
+                    else "header_independent_legacy_exact_crop_audit"
+                )
             ),
             "input_dm_half_width_pc_cm3": (
                 float(config["input_dsa_dm_half_width_pc_cm3"]) if uncertainty_mode else 0.0
@@ -729,26 +880,62 @@ def run(
             "raw_state_claim": (
                 dsa_audit["input_state_contract"]["raw_state_claim"]
                 if uncertainty_mode
-                else "raw total DM equals accepted product DM under legacy audit"
+                else (
+                    "owner-confirmed product-state coordinate; not inferred from raw bytes"
+                    if raw_only
+                    else "raw total DM equals accepted product DM under legacy audit"
+                )
             ),
             "proof": (
                 "bound v3 reconstruction artifact and endpoint propagation"
                 if uncertainty_mode
                 else (
-                    f"{row_match['selected_count']} accepted-live rows all match "
-                    f"raw start sample {crop_start}; frequency-dependent residual "
-                    "fit passes the configured near-zero gate"
+                    "owner-confirmed product dispersion state plus raw filterbank "
+                    "hash, authoritative frequency order, explicit support hash, "
+                    "fixed crop, and independently measured raw-profile peak"
+                    if raw_only
+                    else (
+                        f"{row_match['selected_count']} accepted-live rows all match "
+                        f"raw start sample {crop_start}; frequency-dependent residual "
+                        "fit passes the configured near-zero gate"
+                    )
                 )
             ),
-            "sampled_row_count": int(row_match["selected_count"]),
+            "sampled_row_count": (
+                0 if raw_only else int(row_match["selected_count"])
+            ),
             "matched_start_sample_min": int(row_match["start_sample_min"]),
             "matched_start_sample_max": int(row_match["start_sample_max"]),
-            "inferred_reference_minus_raw_dm_pc_cm3": float(
-                state["inferred_reference_minus_raw_dm_pc_cm3"]
+            "inferred_reference_minus_raw_dm_pc_cm3": (
+                None
+                if raw_only
+                else float(state["inferred_reference_minus_raw_dm_pc_cm3"])
             ),
-            "direct_frequency_order_median_correlation": direct_correlation,
-            "reversed_frequency_order_median_correlation": reversed_correlation,
-            "row_start_residual_mad_samples": float(state["start_residual_mad_samples"]),
+            "direct_frequency_order_median_correlation": (
+                None if raw_only else direct_correlation
+            ),
+            "reversed_frequency_order_median_correlation": (
+                None if raw_only else reversed_correlation
+            ),
+            "row_start_residual_mad_samples": (
+                None if raw_only else float(state["start_residual_mad_samples"])
+            ),
+            **(
+                {
+                    "trigger_reference": dsa_audit.get(
+                        "trigger_reference",
+                        {
+                            "sample": int(config["dsa_trigger_reference_sample"]),
+                            "frequency_mhz": float(
+                                config["dsa_trigger_reference_frequency_mhz"]
+                            ),
+                            "method": "configured raw-filterbank trigger sample",
+                        },
+                    )
+                }
+                if raw_only
+                else {}
+            ),
         },
         "dedispersion": {
             "coordinate": "absolute total DM in pc cm^-3",

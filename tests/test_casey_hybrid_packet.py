@@ -168,6 +168,9 @@ def test_hybrid_packet_renderer_accepts_current_schema(tmp_path: Path) -> None:
             / "analysis-configs/absolute-dm/casey.json"
         ).read_text()
     )
+    # This renderer is compatibility-only and intentionally exercises the
+    # historical archival-reference contract, never the active raw-only path.
+    config["workflow"]["observation_source"] = "legacy_archival_reference"
     config["paths"]["accepted_chime_reference"] = str(accepted_chime)
     config["paths"]["accepted_dsa_reference"] = str(accepted_dsa)
     config["identity"]["input_basenames"]["accepted_chime_reference"] = (

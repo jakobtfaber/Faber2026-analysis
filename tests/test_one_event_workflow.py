@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -83,14 +84,21 @@ def _substituted_config() -> dict:
         "accepted_dsa_reference",
         "output_root",
     ):
-        config["paths"][key] = config["paths"][key].replace("casey", "replacement")
+        if key in config["paths"]:
+            config["paths"][key] = config["paths"][key].replace(
+                "casey",
+                "replacement",
+            )
     for key in (
         "raw_chime_h5",
         "accepted_chime_reference",
         "raw_dsa_filterbank",
         "accepted_dsa_reference",
     ):
-        config["identity"]["input_basenames"][key] = Path(config["paths"][key]).name
+        if key in config["paths"]:
+            config["identity"]["input_basenames"][key] = Path(
+                config["paths"][key]
+            ).name
     config["identity"]["output_root_basename"] = Path(config["paths"]["output_root"]).name
     return config
 
@@ -551,6 +559,64 @@ def test_casey_regression_fixture_validates() -> None:
     assert config["chime"]["upchannel_factor"] == 16
     assert config["geometry"]["reference_frequency_mhz"] == 400.0
     assert config["dsa"]["gates"]["edge_fail_closed"] is True
+
+
+def test_raw_only_config_rejects_archival_intensity_inputs() -> None:
+    config = _config()
+    config["paths"]["accepted_chime_reference"] = "/tmp/archival.npy"
+    config["identity"]["input_basenames"]["accepted_chime_reference"] = "archival.npy"
+    config["input_sha256"]["accepted_chime_reference"] = "a" * 64
+    config["event_binding_sha256"] = event_binding_sha256(config)
+    with pytest.raises(ValueError, match="forbids archival intensity inputs"):
+        validate_config(config)
+
+
+@pytest.mark.parametrize(
+    ("script", "extra"),
+    [
+        (
+            "run_independent_joint_fit_component.py",
+            [
+                "--morphology",
+                "gaussian",
+                "--checkpoint-dir",
+                "/tmp/checkpoint",
+                "--receipt",
+                "/tmp/receipt.json",
+            ],
+        ),
+        (
+            "finalize_independent_joint_fit.py",
+            ["--output-dir", "/tmp/output"],
+        ),
+    ],
+)
+def test_independent_fit_entrypoints_reject_blocked_config(
+    script: str,
+    extra: list[str],
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / script),
+            "--config",
+            str(CONFIG),
+            "--chime-observation",
+            "/tmp/chime.npz",
+            "--dsa-observation",
+            "/tmp/dsa.npz",
+            "--geometry-constraint",
+            "/tmp/geometry.json",
+            *extra,
+        ],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "blocked pending reviewed inputs" in result.stderr
 
 
 def test_schema_accepts_casey_fixture_when_jsonschema_is_available() -> None:

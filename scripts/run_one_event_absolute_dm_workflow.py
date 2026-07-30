@@ -709,29 +709,34 @@ def _stage_input_files(
     paths: dict[str, Path],
 ) -> list[Path]:
     source = config["paths"]
+    raw_only = (
+        config["workflow"].get("observation_source")
+        == "raw_instrument_products_only"
+    )
     if stage == "preflight":
         return [_resolve(source[key], repo_root) for key in config["input_sha256"]]
     if stage == "dsa_audit":
-        inputs = [
-            _resolve(source["raw_dsa_filterbank"], repo_root),
-            _resolve(source["accepted_dsa_reference"], repo_root),
-        ]
+        inputs = [_resolve(source["raw_dsa_filterbank"], repo_root)]
+        if not raw_only:
+            inputs.append(_resolve(source["accepted_dsa_reference"], repo_root))
         for key in ("dsa_state_reconstruction", "dsa_state_calibration"):
             if key in source:
                 inputs.append(_resolve(source[key], repo_root))
         return inputs
     if stage == "chime_products":
-        return [
-            _resolve(source["raw_chime_h5"], repo_root),
-            _resolve(source["accepted_chime_reference"], repo_root),
-        ]
+        inputs = [_resolve(source["raw_chime_h5"], repo_root)]
+        if not raw_only:
+            inputs.append(_resolve(source["accepted_chime_reference"], repo_root))
+        return inputs
     if stage == "dsa_products":
-        return [
+        inputs = [
             paths["chime_result"],
             paths["dsa_audit"],
             _resolve(source["raw_dsa_filterbank"], repo_root),
-            _resolve(source["accepted_dsa_reference"], repo_root),
         ]
+        if not raw_only:
+            inputs.append(_resolve(source["accepted_dsa_reference"], repo_root))
+        return inputs
     if stage == "geometry_constraint":
         return []
     if stage == "joint_fit":
@@ -745,19 +750,23 @@ def _stage_input_files(
             paths["geometry_constraint"],
         ]
     if stage == "chime_oracle":
-        return [
+        inputs = [
             paths["fit_result"],
             _resolve(source["raw_chime_h5"], repo_root),
-            _resolve(source["accepted_chime_reference"], repo_root),
         ]
+        if not raw_only:
+            inputs.append(_resolve(source["accepted_chime_reference"], repo_root))
+        return inputs
     if stage == "dsa_oracle":
-        return [
+        inputs = [
             paths["fit_result"],
             paths["chime_result"],
             paths["dsa_audit"],
             _resolve(source["raw_dsa_filterbank"], repo_root),
-            _resolve(source["accepted_dsa_reference"], repo_root),
         ]
+        if not raw_only:
+            inputs.append(_resolve(source["accepted_dsa_reference"], repo_root))
+        return inputs
     if stage == "oracle_check":
         return [
             paths["fit_result"],

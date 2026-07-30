@@ -7,14 +7,12 @@
     "reviewed_event": "casey",
     "input_basenames": {
       "raw_chime_h5": "singlebeam_362593221.h5",
-      "accepted_chime_reference": "casey_chime_I_491_2085_32000b_cntr_bpc.npy",
       "raw_dsa_filterbank": "240229aaad_dev_polcal_I.fil",
-      "accepted_dsa_reference": "casey_dsa_I_491_211_2500b_cntr_bpc.npy",
       "timing_results": "toa_crossmatch_results.json",
       "trigger_recovery": "trigger_mjd_microsecond_recovery.json",
       "reproduction_fixture": "notebook_reproduction_fixture.json"
     },
-    "output_root_basename": "casey-one-event-workflow",
+    "output_root_basename": "casey-raw-only-preflight",
     "disallowed_event_tokens": [
       "chromatica",
       "freya",
@@ -31,19 +29,15 @@
   },
   "paths": {
     "raw_chime_h5": "/data/Faber2026/data/chime-frb/casey/singlebeam_362593221.h5",
-    "accepted_chime_reference": "/data/Faber2026/runs/flits-runs/data/casey_chime_I_491_2085_32000b_cntr_bpc.npy",
     "raw_dsa_filterbank": "/data/Faber2026/data/dsa-110/casey/240229aaad_dev_polcal_I.fil",
-    "accepted_dsa_reference": "/data/Faber2026/runs/flits-runs/data/dsa/casey_dsa_I_491_211_2500b_cntr_bpc.npy",
     "timing_results": "/data/Faber2026/evidence/dm-toa-geometry-20260728/phase-b-control/shared-inputs/toa_crossmatch_results.json",
     "trigger_recovery": "/data/Faber2026/evidence/dm-toa-geometry-20260728/phase-b-control/shared-inputs/trigger_mjd_microsecond_recovery.json",
     "reproduction_fixture": "/data/Faber2026/evidence/dm-toa-geometry-20260728/phase-b-control/shared-inputs/notebook_reproduction_fixture.json",
-    "output_root": "/data/Faber2026/evidence/dm-toa-geometry-20260728/casey-one-event-workflow"
+    "output_root": "/data/Faber2026/evidence/dm-toa-geometry-20260728/casey-raw-only-preflight"
   },
   "input_sha256": {
     "raw_chime_h5": "ea15c60b2bc770b30ab24d2d21e8e3fac8f5f3fe02238019ef258679770ebc0c",
-    "accepted_chime_reference": "79e9cba92716263d7644cafafe4d35a3ea646f18509be094033b67c6fc4440c4",
     "raw_dsa_filterbank": "8eb60706543875363f20f21ab1473d439f356120b8f8852cedaa9e567b938bd1",
-    "accepted_dsa_reference": "5ec04b0d83f66b67209e1539a37e5b917c294784ac85ae6572116fbd319bc4df",
     "timing_results": "3743073c9feb8e5f8ad54f10ebe015b712e8ef908adc6be3f8892ae20f558c8c",
     "trigger_recovery": "87852969eb41c2abfa4c6534557ad03ed4f3e16e64cf1b28bd9da35f4ff89a0e",
     "reproduction_fixture": "2b139029b054c4d42e6950bb346d9cf8738c306ad1a4e2e621d16da6af9e60d1"
@@ -76,6 +70,7 @@
       "live_count": 720,
       "h5_present_count": 771,
       "h5_missing_count": 253,
+      "mask_sha256": "cd3164be954b6743ef0cf9505482fb99dc45d8c6edb87f499f0a8014c8a22e2a",
       "h5_present_accepted_dead_ids": [
         3,
         4,
@@ -135,7 +130,13 @@
   },
   "dsa": {
     "accepted_reference_dm_pc_cm3": 491.211,
+    "product_dm_state_source": "owner-confirmed Casey raw-filterbank product state from the 2026-07-30 analysis handoff",
     "raw_crop_start_sample": 13998,
+    "trigger_reference_sample": 1261,
+    "trigger_reference_frequency_mhz": 1530.0,
+    "trigger_time_semantics": "curated DSA-110 arrival timestamp at 1530 MHz; assigned to the independently measured accepted-channel raw-profile peak",
+    "trigger_time_source": "hash-bound trigger recovery plus notebook reproduction fixture native-frequency semantics",
+    "trigger_search_noise_stop_sample": 1000,
     "crop_samples": 2500,
     "padding_samples": 64,
     "audit_sample_rows": 96,
@@ -143,12 +144,55 @@
       "full_grid_rows": 6144,
       "live_count": 6104,
       "dead_count": 40,
+      "accepted_dead_channel_ids": [
+        283,
+        758,
+        800,
+        1033,
+        1321,
+        1552,
+        1561,
+        1649,
+        1722,
+        1756,
+        1799,
+        1845,
+        2429,
+        2481,
+        2664,
+        2789,
+        2901,
+        3064,
+        3072,
+        3073,
+        3074,
+        3075,
+        3076,
+        3077,
+        3078,
+        3079,
+        3089,
+        3358,
+        3490,
+        3520,
+        3885,
+        4072,
+        5212,
+        5286,
+        5311,
+        5335,
+        5411,
+        5579,
+        5629,
+        5824
+      ],
+      "mask_sha256": "ee4f73690bf1cd79648e2b093beaace94fc569833cebf0c0ac836d8c30fafa86",
       "manual_bad_channel_ids": []
     },
     "gates": {
       "direct_correlation_min": 0.9,
       "reversed_correlation_max": 0.1,
-      "reference_minus_raw_dm_abs_max_pc_cm3": 0.000001,
+      "reference_minus_raw_dm_abs_max_pc_cm3": 1e-06,
       "edge_fail_closed": true
     }
   },
@@ -171,8 +215,8 @@
       "source_icrs": "11h19m56.05s +70d40m34.4s",
       "epoch_mjd_utc": "60369.37095221912",
       "site_delay_sigma_s": {
-        "chime": 5e-7,
-        "dsa": 5e-7
+        "chime": 5e-07,
+        "dsa": 5e-07
       },
       "clock_sigma_s": {
         "chime": 0.0007071067811865475,
@@ -187,7 +231,7 @@
         "absolute_utc_calibration_status": "not_independently_measured",
         "owner_adoption_date": "2026-07-29"
       },
-      "maximum_projection_disagreement_s": 5e-7
+      "maximum_projection_disagreement_s": 5e-07
     },
     "resolution": {
       "status": "pending_owner_review",
@@ -279,6 +323,7 @@
     }
   },
   "workflow": {
+    "observation_source": "raw_instrument_products_only",
     "execution_authorized": false,
     "regression_fixture": true,
     "chime_container_image": "chimefrb/baseband-analysis@sha256:f510909d892d0d5224c982c590cbe80967a49a59b79c396ab72bb710105c4c41",
@@ -297,5 +342,5 @@
       "manifests"
     ]
   },
-  "event_binding_sha256": "7bf5c84aafec431d0b2b2ac979e930ccc21f619d6a8beb75ff4b2263653d4cb0"
+  "event_binding_sha256": "7c3c1c7d9cbb9a6d671e00443c1494d32d4a8f6bef1de624aaf36594d10a95f5"
 }

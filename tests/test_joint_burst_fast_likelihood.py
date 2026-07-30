@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import pickle
+
 import numpy as np
+import pytest
 
 from radio_pipeline.fitting.joint_burst import (
     BandObservation,
@@ -89,3 +92,40 @@ def test_multiple_components_still_use_general_matrix_integral() -> None:
     )
     assert actual == expected
     np.testing.assert_array_equal(model, expected_model)
+
+
+def test_observation_owns_immutable_inputs_and_cached_statistics() -> None:
+    rng = np.random.default_rng(29)
+    source = rng.normal(size=(4, 19))
+    observation = BandObservation(
+        instrument="dsa",
+        waterfall=source,
+        valid=np.ones_like(source, dtype=bool),
+        frequency_mhz=np.linspace(1300.0, 1500.0, 4),
+        channel_width_mhz=np.full(4, 0.1),
+        noise_std=np.ones_like(source),
+        sample_interval_s=1.0e-4,
+        time0_unix_ns=1_700_000_000_000_000_000,
+        reference_frequency_mhz=400.0,
+        dispersion=DispersionState(0.0, 100.0, 0.0, 100.0, "raw_filterbank"),
+        input_sha256={"raw": "a" * 64},
+    )
+    kernel = rng.normal(size=(1, *source.shape))
+    before = _gain_marginal_band(observation, kernel, 2.0, return_model=False)[0]
+    source[:] = 99.0
+    after = _gain_marginal_band(observation, kernel, 2.0, return_model=False)[0]
+    assert before == after
+    assert not observation.waterfall.flags.writeable
+    with pytest.raises(ValueError, match="cannot set WRITEABLE"):
+        observation.waterfall.flags.writeable = True
+    with pytest.raises(TypeError):
+        observation.input_sha256["raw"] = "b" * 64
+    with pytest.raises(TypeError):
+        observation.input_sha256 |= {"raw": "b" * 64}
+    with pytest.raises(AttributeError):
+        observation.waterfall = np.zeros_like(observation.waterfall)
+    restored = pickle.loads(pickle.dumps(observation))
+    with pytest.raises(ValueError, match="cannot set WRITEABLE"):
+        restored.waterfall.flags.writeable = True
+    with pytest.raises(TypeError):
+        restored.input_sha256["raw"] = "b" * 64

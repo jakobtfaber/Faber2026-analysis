@@ -52,9 +52,7 @@
           "additionalProperties": false,
           "required": [
             "raw_chime_h5",
-            "accepted_chime_reference",
             "raw_dsa_filterbank",
-            "accepted_dsa_reference",
             "timing_results",
             "trigger_recovery",
             "reproduction_fixture"
@@ -89,9 +87,7 @@
       "additionalProperties": false,
       "required": [
         "raw_chime_h5",
-        "accepted_chime_reference",
         "raw_dsa_filterbank",
-        "accepted_dsa_reference",
         "timing_results",
         "trigger_recovery",
         "reproduction_fixture",
@@ -135,9 +131,7 @@
       "additionalProperties": false,
       "required": [
         "raw_chime_h5",
-        "accepted_chime_reference",
         "raw_dsa_filterbank",
-        "accepted_dsa_reference",
         "timing_results",
         "trigger_recovery",
         "reproduction_fixture"
@@ -231,6 +225,10 @@
         "accepted_reference_dm_pc_cm3": {
           "type": "number"
         },
+        "product_dm_state_source": {
+          "type": "string",
+          "minLength": 1
+        },
         "input_dm_pc_cm3": {
           "type": "number"
         },
@@ -280,6 +278,26 @@
         "raw_crop_start_sample": {
           "type": "integer",
           "minimum": 0
+        },
+        "trigger_reference_sample": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "trigger_reference_frequency_mhz": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "trigger_time_semantics": {
+          "type": "string",
+          "minLength": 1
+        },
+        "trigger_time_source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "trigger_search_noise_stop_sample": {
+          "type": "integer",
+          "minimum": 1
         },
         "crop_samples": {
           "type": "integer",
@@ -840,6 +858,12 @@
         "stages"
       ],
       "properties": {
+        "observation_source": {
+          "enum": [
+            "raw_instrument_products_only",
+            "legacy_archival_reference"
+          ]
+        },
         "execution_authorized": {
           "type": "boolean"
         },
@@ -954,6 +978,71 @@
     }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "workflow": {
+            "properties": {
+              "observation_source": {
+                "const": "raw_instrument_products_only"
+              }
+            },
+            "required": ["observation_source"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "identity": {
+            "properties": {
+              "input_basenames": {
+                "properties": {
+                  "accepted_chime_reference": false,
+                  "accepted_dsa_reference": false
+                }
+              }
+            }
+          },
+          "paths": {
+            "properties": {
+              "accepted_chime_reference": false,
+              "accepted_dsa_reference": false
+            }
+          },
+          "input_sha256": {
+            "properties": {
+              "accepted_chime_reference": false,
+              "accepted_dsa_reference": false
+            }
+          },
+          "chime": {
+            "properties": {
+              "accepted_support": {
+                "required": ["mask_sha256"]
+              }
+            }
+          },
+          "dsa": {
+            "required": [
+              "product_dm_state_source",
+              "trigger_reference_sample",
+              "trigger_reference_frequency_mhz",
+              "trigger_time_semantics",
+              "trigger_time_source",
+              "trigger_search_noise_stop_sample"
+            ],
+            "properties": {
+              "accepted_support": {
+                "required": [
+                  "accepted_dead_channel_ids",
+                  "mask_sha256"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {
@@ -1199,6 +1288,9 @@
             "minimum": 0
           }
         },
+        "mask_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
         "manual_bad_channel_ids": {
           "const": []
         },
@@ -1228,6 +1320,17 @@
         "dead_count": {
           "type": "integer",
           "minimum": 0
+        },
+        "accepted_dead_channel_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "uniqueItems": true
+        },
+        "mask_sha256": {
+          "$ref": "#/$defs/sha256"
         },
         "manual_bad_channel_ids": {
           "const": []

@@ -189,15 +189,26 @@ def _request(
             ),
         )
     expected_inputs = config["input_sha256"]
-    if observations[0].input_sha256 != {
+    expected_chime_hashes = {
         "raw_chime_h5": expected_inputs["raw_chime_h5"],
-        "accepted_chime_reference": expected_inputs["accepted_chime_reference"],
-    }:
-        raise ValueError("CHIME observation input hashes differ from configuration")
-    if observations[1].input_sha256 != {
+        "accepted_chime_support": config["chime"]["accepted_support"]["mask_sha256"],
+    }
+    expected_dsa_hashes = {
         "raw_dsa_filterbank": expected_inputs["raw_dsa_filterbank"],
-        "accepted_dsa_reference": expected_inputs["accepted_dsa_reference"],
-    }:
+        "accepted_dsa_support": config["dsa"]["accepted_support"]["mask_sha256"],
+    }
+    if config["workflow"].get("observation_source") != "raw_instrument_products_only":
+        expected_chime_hashes = {
+            "raw_chime_h5": expected_inputs["raw_chime_h5"],
+            "accepted_chime_reference": expected_inputs["accepted_chime_reference"],
+        }
+        expected_dsa_hashes = {
+            "raw_dsa_filterbank": expected_inputs["raw_dsa_filterbank"],
+            "accepted_dsa_reference": expected_inputs["accepted_dsa_reference"],
+        }
+    if observations[0].input_sha256 != expected_chime_hashes:
+        raise ValueError("CHIME observation input hashes differ from configuration")
+    if observations[1].input_sha256 != expected_dsa_hashes:
         raise ValueError("DSA observation input hashes differ from configuration")
     resolution = settings["resolution"]
     for observation, product_path in zip(observations, (chime_path, dsa_path), strict=True):
