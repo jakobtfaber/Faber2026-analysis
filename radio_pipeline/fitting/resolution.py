@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from .joint_burst import BandObservation
+from .joint_burst import K_DM_S_MHZ2, BandObservation
 from .products import (
     load_band_observation_product,
     sha256_file,
@@ -20,6 +20,7 @@ from .products import (
 )
 
 ALGORITHM = "native_order_inverse_variance_v1"
+SMEARING_ALGORITHM = "residual_intra_bin_edge_delay_v1"
 
 
 def arrays_sha256(*arrays: Any) -> str:
@@ -46,6 +47,63 @@ def sample_time_axis_ns(
         np.arange(sample_count, dtype=np.float64) * float(sample_interval_s) * 1.0e9
     ).astype(np.int64)
     return np.asarray(int(time0_unix_ns), dtype=np.int64) + offsets_ns
+
+
+def residual_smearing_calculation(
+    observation: BandObservation,
+    *,
+    absolute_dm_bounds_pc_cm3: tuple[float, float],
+    frequency_bin_factor: int,
+    frequency_contiguity_tolerance_mhz: float = 1.0e-9,
+) -> dict[str, Any]:
+    """Bound residual dispersion across every proposed averaged channel."""
+
+    factor = _positive_factor(frequency_bin_factor, "frequency_bin_factor")
+    dm_bounds = tuple(float(value) for value in absolute_dm_bounds_pc_cm3)
+    if (
+        len(dm_bounds) != 2
+        or not np.all(np.isfinite(dm_bounds))
+        or dm_bounds[0] >= dm_bounds[1]
+    ):
+        raise ValueError("absolute DM bounds must be finite and increasing")
+    product_bounds = observation.dispersion.product_dm_bounds_pc_cm3
+    if product_bounds is None:
+        product_bounds = (
+            observation.dispersion.product_dm_pc_cm3,
+            observation.dispersion.product_dm_pc_cm3,
+        )
+    maximum_residual = max(
+        abs(absolute_dm - product_dm)
+        for absolute_dm in dm_bounds
+        for product_dm in product_bounds
+    )
+    frequency, width = _group_frequencies(
+        observation,
+        factor,
+        frequency_contiguity_tolerance_mhz,
+    )
+    lower = frequency - width / 2.0
+    upper = frequency + width / 2.0
+    smear = (
+        K_DM_S_MHZ2
+        * maximum_residual
+        * np.abs(np.power(lower, -2.0) - np.power(upper, -2.0))
+    )
+    worst = int(np.argmax(smear))
+    return {
+        "algorithm": SMEARING_ALGORITHM,
+        "dispersion_constant_s_mhz2": K_DM_S_MHZ2,
+        "reference_frequency_mhz": 400.0,
+        "absolute_dm_bounds_pc_cm3": list(dm_bounds),
+        "product_dm_bounds_pc_cm3": list(product_bounds),
+        "maximum_absolute_residual_dm_pc_cm3": float(maximum_residual),
+        "frequency_bin_factor": factor,
+        "maximum_smearing_s": float(smear[worst]),
+        "worst_frequency_mhz": float(frequency[worst]),
+        "worst_channel_width_mhz": float(width[worst]),
+        "fit_sample_interval_s": float(observation.sample_interval_s),
+        "output_frequency_count": int(frequency.size),
+    }
 
 
 @dataclass(frozen=True, slots=True)
