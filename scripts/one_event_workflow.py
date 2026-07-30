@@ -319,22 +319,6 @@ def apply_review_decision(
             contract = observation_contracts[instrument]
             fit_sample_s = float(contract["sample_interval_s"])
             fit_shape = [int(value) for value in contract["shape"]]
-            if (
-                fit_shape != approved_resolution[f"{instrument}_shape"]
-                or not math.isclose(
-                    fit_sample_s,
-                    float(approved_resolution[f"{instrument}_sample_interval_s"]),
-                    rel_tol=0.0,
-                    abs_tol=1.0e-15,
-                )
-                or contract["frequency_grid_sha256"]
-                != approved_resolution[f"{instrument}_frequency_grid_sha256"]
-                or contract["valid_mask_sha256"]
-                != approved_resolution[f"{instrument}_valid_mask_sha256"]
-            ):
-                raise ValueError(
-                    f"{instrument} component proposal belongs to another fit grid"
-                )
             narrowest_fwhm_s = min(
                 float(row["matched_filter_width_samples"]) * fit_sample_s
                 for row in instrument_components
@@ -348,6 +332,22 @@ def apply_review_decision(
             raise ValueError(
                 f"{instrument} lacks analytic fit-resolution smearing evidence"
             ) from exc
+        if (
+            fit_shape != approved_resolution[f"{instrument}_shape"]
+            or not math.isclose(
+                fit_sample_s,
+                float(approved_resolution[f"{instrument}_sample_interval_s"]),
+                rel_tol=0.0,
+                abs_tol=1.0e-15,
+            )
+            or contract["frequency_grid_sha256"]
+            != approved_resolution[f"{instrument}_frequency_grid_sha256"]
+            or contract["valid_mask_sha256"]
+            != approved_resolution[f"{instrument}_valid_mask_sha256"]
+        ):
+            raise ValueError(
+                f"{instrument} component proposal belongs to another fit grid"
+            )
         if smearing_s > (
             float(
                 resolution_policy[
