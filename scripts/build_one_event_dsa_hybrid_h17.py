@@ -88,6 +88,22 @@ def apply_residual_dm_absolute_crop(
     return corrected
 
 
+def reference_frequency_time0_unix_ns(
+    native_time0_unix_ns: int,
+    *,
+    input_dm_pc_cm3: float,
+    target_dm_pc_cm3: float,
+    native_reference_frequency_mhz: float,
+) -> int:
+    """Translate a native-band timestamp to the target's 400 MHz epoch."""
+
+    delay_s = K_DM_S_MHZ2 * (
+        float(target_dm_pc_cm3) * REFERENCE_FREQUENCY_MHZ**-2
+        - float(input_dm_pc_cm3) * float(native_reference_frequency_mhz) ** -2
+    )
+    return int(native_time0_unix_ns) + round(delay_s * 1.0e9)
+
+
 def _accepted_support(reference: np.ndarray, expected: dict) -> np.ndarray:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -415,7 +431,7 @@ def run(
     )
     if "tstart" not in reader.header:
         raise RuntimeError("DSA filterbank lacks an authoritative MJD time origin")
-    product_time0_unix_ns = mjd_crop_time0_unix_ns(
+    native_time0_unix_ns = mjd_crop_time0_unix_ns(
         reader.header["tstart"],
         crop_start,
         sample_time_s,
@@ -430,6 +446,7 @@ def run(
         if uncertainty_mode
         else config["accepted_dsa_reference_dm_pc_cm3"]
     )
+    native_reference_frequency_mhz = float(config["dsa_native_frequency_mhz"])
     window = int(config["dsa_crop_samples"])
     if reference.shape[1] != window:
         raise RuntimeError("accepted DSA crop length changed")
@@ -464,7 +481,12 @@ def run(
         target_dm=input_dm,
         input_dm=input_dm,
         source_start_sample=crop_start,
-        time0_unix_ns=product_time0_unix_ns,
+        time0_unix_ns=reference_frequency_time0_unix_ns(
+            native_time0_unix_ns,
+            input_dm_pc_cm3=input_dm,
+            target_dm_pc_cm3=input_dm,
+            native_reference_frequency_mhz=native_reference_frequency_mhz,
+        ),
         channel_width_mhz=channel_width_mhz,
         input_sha256=input_hashes,
     )
@@ -477,7 +499,12 @@ def run(
         target_dm=float(config["accepted_dsa_reference_dm_pc_cm3"]),
         input_dm=input_dm,
         source_start_sample=crop_start,
-        time0_unix_ns=product_time0_unix_ns,
+        time0_unix_ns=reference_frequency_time0_unix_ns(
+            native_time0_unix_ns,
+            input_dm_pc_cm3=input_dm,
+            target_dm_pc_cm3=float(config["accepted_dsa_reference_dm_pc_cm3"]),
+            native_reference_frequency_mhz=native_reference_frequency_mhz,
+        ),
         channel_width_mhz=channel_width_mhz,
         input_sha256=input_hashes,
         input_assumption="external_accepted_reference",
@@ -553,7 +580,12 @@ def run(
                     target_dm=target_dm,
                     input_dm=assumed_input_dm,
                     source_start_sample=crop_start,
-                    time0_unix_ns=product_time0_unix_ns,
+                    time0_unix_ns=reference_frequency_time0_unix_ns(
+                        native_time0_unix_ns,
+                        input_dm_pc_cm3=assumed_input_dm,
+                        target_dm_pc_cm3=target_dm,
+                        native_reference_frequency_mhz=native_reference_frequency_mhz,
+                    ),
                     channel_width_mhz=channel_width_mhz,
                     input_sha256=input_hashes,
                     input_assumption=assumption,
@@ -647,7 +679,12 @@ def run(
                 target_dm=target_dm,
                 input_dm=input_dm,
                 source_start_sample=crop_start,
-                time0_unix_ns=product_time0_unix_ns,
+                time0_unix_ns=reference_frequency_time0_unix_ns(
+                    native_time0_unix_ns,
+                    input_dm_pc_cm3=input_dm,
+                    target_dm_pc_cm3=target_dm,
+                    native_reference_frequency_mhz=native_reference_frequency_mhz,
+                ),
                 channel_width_mhz=channel_width_mhz,
                 input_sha256=input_hashes,
             )

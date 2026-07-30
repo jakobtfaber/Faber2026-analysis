@@ -176,6 +176,17 @@ def test_different_native_grids_share_one_absolute_dm_maximum() -> None:
     assert truth_score > _log_likelihood(high, request, layout, "gaussian")
 
 
+def test_absolute_time_origin_mismatch_fails_before_sampling() -> None:
+    request = _request()
+    shifted_dsa = replace(
+        request.observations[1],
+        time0_unix_ns=request.observations[1].time0_unix_ns - 11_000_000_000,
+    )
+    broken = replace(request, observations=(request.observations[0], shifted_dsa))
+    with pytest.raises(ValueError, match="absolute time origins"):
+        fit_joint_event(broken)
+
+
 @pytest.mark.parametrize(
     ("chime_dt", "dsa_dt", "chime_rows", "dsa_rows"),
     (

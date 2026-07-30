@@ -12,7 +12,7 @@ import numpy as np
 from fit_one_event_joint_burst import _request
 from one_event_workflow import load_config
 
-from radio_pipeline.fitting.joint_burst import _fit_one
+from radio_pipeline.fitting.joint_burst import _fit_one, _matched_window_diagnostics
 from radio_pipeline.fitting.products import sha256_file
 
 
@@ -43,6 +43,12 @@ def main() -> None:
             resume=True,
         ),
     )
+    worst_gap_sigma = max(
+        float(row["nominal_gap_sigma"])
+        for row in _matched_window_diagnostics(request).values()
+    )
+    if worst_gap_sigma > request.settings.maximum_timing_offset_sigma:
+        raise ValueError("matched windows fail the absolute-time preflight")
     if len(request.associations) != 1:
         raise ValueError("independent runner requires one configured association")
     fit = _fit_one(request, request.associations[0], args.morphology)

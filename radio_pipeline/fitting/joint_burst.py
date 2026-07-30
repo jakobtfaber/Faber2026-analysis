@@ -1335,6 +1335,15 @@ def fit_joint_event(request: JointFitRequest) -> JointFitResult:
     checkpointing, and rendering.
     """
 
+    matched_offsets = _matched_window_diagnostics(request)
+    worst_gap_sigma = max(
+        float(row["nominal_gap_sigma"]) for row in matched_offsets.values()
+    )
+    if worst_gap_sigma > request.settings.maximum_timing_offset_sigma:
+        raise ValueError(
+            "matched component windows are inconsistent with the absolute "
+            "time origins and geometric delays"
+        )
     runs = [
         _fit_one(request, hypothesis, morphology)
         for morphology in request.settings.morphologies

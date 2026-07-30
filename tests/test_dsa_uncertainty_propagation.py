@@ -18,6 +18,7 @@ from build_one_event_dsa_hybrid_h17 import (  # noqa: E402
     apply_residual_dm_absolute_crop,
     endpoint_gate_summary,
     reference_400_timing_half_width,
+    reference_frequency_time0_unix_ns,
 )
 from run_one_event_absolute_dm_workflow import (  # noqa: E402
     _output_paths,
@@ -58,6 +59,16 @@ def test_absolute_crop_uses_nonwrapping_fractional_coordinates() -> None:
         8,
     )
     assert np.isnan(edge).any()
+
+
+def test_dsa_time_origin_is_referred_to_400_mhz_exactly_once() -> None:
+    actual = reference_frequency_time0_unix_ns(
+        1_709_196_850_538_686_464,
+        input_dm_pc_cm3=491.211,
+        target_dm_pc_cm3=491.28,
+        native_reference_frequency_mhz=1530.0,
+    )
+    assert actual == 1_709_196_862_407_021_682
 
 
 def test_profile_alignment_reports_shift_without_morphology_loss() -> None:
