@@ -6,7 +6,7 @@ import json
 import numpy as np
 import pytest
 from one_event_workflow import event_binding_sha256
-from propose_joint_fit_components import run
+from propose_joint_fit_components import _expected_input_hashes, run
 
 from radio_pipeline.fitting import DispersionState
 from radio_pipeline.fitting.products import write_band_observation_product
@@ -178,6 +178,51 @@ def test_injected_c1d1_proposal_preserves_native_grids_and_emits_pdf(tmp_path) -
         assert component["padding_samples"] >= 4
         assert component["width_bounds_s"][0] < component["width_bounds_s"][1]
         assert min(component["off_pulse_samples"].values()) >= 8
+
+
+def test_raw_only_proposal_requires_explicit_support_identity(tmp_path) -> None:
+    config, config_path, chime, dsa = _inputs(tmp_path)
+    config["workflow"] = {"observation_source": "raw_instrument_products_only"}
+    config["chime"] = {"accepted_support": {"mask_sha256": "5" * 64}}
+    config["dsa"] = {"accepted_support": {"mask_sha256": "6" * 64}}
+    config["event_binding_sha256"] = event_binding_sha256(config)
+    config_path.write_text(json.dumps(config))
+    for instrument, path in (("chime", chime), ("dsa", dsa)):
+        with np.load(path, allow_pickle=False) as archive:
+            payload = {name: archive[name] for name in archive.files}
+        payload["input_sha256_json"] = np.asarray(
+            json.dumps(_expected_input_hashes(config, instrument))
+        )
+        np.savez_compressed(path, **payload)
+    run(
+        config_path=config_path,
+        event="injected",
+        chime_path=chime,
+        dsa_path=dsa,
+        output_json=tmp_path / "raw-proposal.json",
+        output_pdf=tmp_path / "raw-proposal.pdf",
+    )
+
+    with np.load(chime, allow_pickle=False) as archive:
+        payload = {name: archive[name] for name in archive.files}
+    payload["input_sha256_json"] = np.asarray(
+        json.dumps(
+            {
+                "raw_chime_h5": "1" * 64,
+                "accepted_chime_reference": "2" * 64,
+            }
+        )
+    )
+    np.savez_compressed(chime, **payload)
+    with pytest.raises(ValueError, match="input identity changed"):
+        run(
+            config_path=config_path,
+            event="injected",
+            chime_path=chime,
+            dsa_path=dsa,
+            output_json=tmp_path / "rejected.json",
+            output_pdf=tmp_path / "rejected.pdf",
+        )
 
 
 def test_proposal_fails_on_low_signal(tmp_path) -> None:

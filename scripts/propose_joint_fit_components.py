@@ -299,14 +299,37 @@ def propose_band(
 
 def _expected_input_hashes(config: dict, instrument: str) -> dict[str, str]:
     hashes = config["input_sha256"]
+    raw_only = (
+        config.get("workflow", {}).get(
+            "observation_source",
+            "legacy_archival_reference",
+        )
+        == "raw_instrument_products_only"
+    )
     if instrument == "chime":
         return {
             "raw_chime_h5": hashes["raw_chime_h5"],
-            "accepted_chime_reference": hashes["accepted_chime_reference"],
+            (
+                "accepted_chime_support"
+                if raw_only
+                else "accepted_chime_reference"
+            ): (
+                config["chime"]["accepted_support"]["mask_sha256"]
+                if raw_only
+                else hashes["accepted_chime_reference"]
+            ),
         }
     return {
         "raw_dsa_filterbank": hashes["raw_dsa_filterbank"],
-        "accepted_dsa_reference": hashes["accepted_dsa_reference"],
+        (
+            "accepted_dsa_support"
+            if raw_only
+            else "accepted_dsa_reference"
+        ): (
+            config["dsa"]["accepted_support"]["mask_sha256"]
+            if raw_only
+            else hashes["accepted_dsa_reference"]
+        ),
     }
 
 
