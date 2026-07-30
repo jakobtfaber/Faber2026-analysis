@@ -1340,6 +1340,23 @@ def fit_joint_event(request: JointFitRequest) -> JointFitResult:
         for morphology in request.settings.morphologies
         for hypothesis in request.associations
     ]
+    return _combine_runs(request, runs)
+
+
+def _combine_runs(
+    request: JointFitRequest,
+    runs: list[HypothesisFit],
+) -> JointFitResult:
+    """Combine independently evaluated runs with the production gates."""
+
+    expected = {
+        (morphology, hypothesis.name)
+        for morphology in request.settings.morphologies
+        for hypothesis in request.associations
+    }
+    actual = {(run.morphology, run.association) for run in runs}
+    if actual != expected or len(runs) != len(expected):
+        raise ValueError("independent runs do not cover the configured model grid exactly")
     log_evidence = np.asarray([run.log_evidence for run in runs])
     relative = log_evidence - np.max(log_evidence)
     raw_run_weights = np.exp(relative)
