@@ -333,7 +333,7 @@ def _approved_transition_inputs(tmp_path: Path) -> tuple[dict, dict, dict]:
             for instrument in ("chime", "dsa")
         },
         "components": components,
-        "associations": copy.deepcopy(
+        "association_hypotheses": copy.deepcopy(
             config["joint_fit"]["review_plan"]["association_hypotheses"]
         ),
     }

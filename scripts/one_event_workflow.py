@@ -283,7 +283,7 @@ def apply_review_decision(
     if component_proposal.get("status") != "proposal_pending_owner_review":
         raise ValueError("component proposal status is invalid")
     components = component_proposal.get("components")
-    associations = component_proposal.get("associations")
+    associations = component_proposal.get("association_hypotheses")
     counts = joint_fit["review_plan"]["component_count"]
     if (
         not isinstance(components, list)
