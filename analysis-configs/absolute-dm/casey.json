@@ -256,7 +256,7 @@
       "nlive": 600,
       "dlogz": 0.5,
       "sample": "rwalk",
-      "pool_size": 1,
+      "pool_size": 16,
       "resume": true
     },
     "acceptance": {
@@ -297,5 +297,5 @@
       "manifests"
     ]
   },
-  "event_binding_sha256": "b82c3069a9f60786de77577124d0c3a68e8c4c42c4ac722949bd177afdb0ecf8"
+  "event_binding_sha256": "7bf5c84aafec431d0b2b2ac979e930ccc21f619d6a8beb75ff4b2263653d4cb0"
 }
