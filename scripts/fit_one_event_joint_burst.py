@@ -4,15 +4,15 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import dynesty
 import numpy as np
-from one_event_workflow import load_config
+from one_event_workflow import arrays_sha256, load_config, sample_time_axis_ns
 
 import radio_pipeline
 from radio_pipeline.fitting import (
@@ -34,13 +34,7 @@ def _require_accepted_status(status: str) -> None:
 
 
 def _arrays_sha256(*arrays: np.ndarray) -> str:
-    digest = hashlib.sha256()
-    for array in arrays:
-        value = np.ascontiguousarray(array)
-        digest.update(value.dtype.str.encode())
-        digest.update(repr(value.shape).encode())
-        digest.update(value.view(np.uint8))
-    return digest.hexdigest()
+    return arrays_sha256(*arrays)
 
 
 def _require_locked_array_identity(observation, resolution: dict) -> None:
@@ -72,6 +66,26 @@ def _require_locked_product_metadata(
         != resolution[f"{instrument}_off_pulse_mask_sha256"]
     ):
         raise ValueError(f"{instrument} locked off-pulse support changed")
+    if (
+        _arrays_sha256(product["waterfall"])
+        != resolution[f"{instrument}_waterfall_sha256"]
+    ):
+        raise ValueError(f"{instrument} locked waterfall pixels changed")
+    if (
+        _arrays_sha256(product["noise_std"])
+        != resolution[f"{instrument}_noise_std_sha256"]
+    ):
+        raise ValueError(f"{instrument} locked noise estimates changed")
+    time_axis_ns = sample_time_axis_ns(
+        time0_unix_ns=int(product["time0_unix_ns"]),
+        sample_interval_s=float(product["sample_interval_s"]),
+        sample_count=int(product["waterfall"].shape[1]),
+    )
+    if (
+        _arrays_sha256(time_axis_ns)
+        != resolution[f"{instrument}_time_axis_sha256"]
+    ):
+        raise ValueError(f"{instrument} locked time axis changed")
 
 
 def _runtime_preflight(repo_root: Path) -> dict[str, str]:
@@ -91,6 +105,53 @@ def _runtime_preflight(repo_root: Path) -> dict[str, str]:
     }
 
 
+def _dsa_product_dm_bounds(
+    config: dict,
+    product_dm_pc_cm3: float,
+) -> tuple[float, float] | None:
+    """Propagate the reviewed raw-input interval through the applied correction."""
+
+    dsa = config["dsa"]
+    if "reference_minus_raw_dm_interval_pc_cm3" not in dsa:
+        return None
+    residual_low, residual_high = map(
+        float,
+        dsa["reference_minus_raw_dm_interval_pc_cm3"],
+    )
+    residual_nominal = float(dsa["reference_minus_raw_dm_pc_cm3"])
+    accepted_dm = float(dsa["accepted_reference_dm_pc_cm3"])
+    if not residual_low < residual_nominal < residual_high:
+        raise ValueError("DSA nominal input-DM residual must lie inside its reviewed interval")
+    method = dsa["input_dm_method"]
+    if method == "inferred_raw_reference_row_timing":
+        nominal_input_dm = float(dsa["input_dm_pc_cm3"])
+        if not np.isclose(
+            nominal_input_dm,
+            accepted_dm - residual_nominal,
+            rtol=0.0,
+            atol=1.0e-12,
+        ):
+            raise ValueError("DSA input-DM point and residual interval use inconsistent coordinates")
+        raw_dm_bounds = accepted_dm - residual_high, accepted_dm - residual_low
+        return (
+            float(product_dm_pc_cm3) + raw_dm_bounds[0] - nominal_input_dm,
+            float(product_dm_pc_cm3) + raw_dm_bounds[1] - nominal_input_dm,
+        )
+    if method == "accepted_product_dm_nominal_with_residual_bound":
+        if not np.isclose(
+            float(dsa["input_dm_pc_cm3"]),
+            accepted_dm,
+            rtol=0.0,
+            atol=1.0e-12,
+        ):
+            raise ValueError("DSA accepted-product nominal must equal the accepted reference DM")
+        return (
+            float(product_dm_pc_cm3) - residual_high,
+            float(product_dm_pc_cm3) - residual_low,
+        )
+    raise ValueError(f"unsupported DSA input-DM method: {method}")
+
+
 def _request(
     config: dict,
     chime_path: Path,
@@ -102,6 +163,31 @@ def _request(
         load_band_observation_product(chime_path),
         load_band_observation_product(dsa_path),
     )
+    dsa_config = config["dsa"]
+    expected_dsa_product_dm = float(config["chime"]["anchor_dm_pc_cm3"])
+    product_dm_bounds = _dsa_product_dm_bounds(
+        config,
+        observations[1].dispersion.product_dm_pc_cm3,
+    )
+    if not np.isclose(
+        observations[1].dispersion.product_dm_pc_cm3,
+        expected_dsa_product_dm,
+        rtol=0.0,
+        atol=1.0e-9,
+    ):
+        raise ValueError("DSA fit product DM differs from the coherent anchor")
+    if product_dm_bounds is not None:
+        observations = (
+            observations[0],
+            replace(
+                observations[1],
+                dispersion=replace(
+                    observations[1].dispersion,
+                    product_dm_bounds_pc_cm3=product_dm_bounds,
+                    product_dm_bound_source=dsa_config["input_dm_bound_source"],
+                ),
+            ),
+        )
     expected_inputs = config["input_sha256"]
     if observations[0].input_sha256 != {
         "raw_chime_h5": expected_inputs["raw_chime_h5"],
@@ -202,6 +288,15 @@ def _request(
         ),
         posterior_edge_fraction=float(settings["acceptance"]["posterior_edge_fraction"]),
         maximum_prior_edge_mass=float(settings["acceptance"]["maximum_prior_edge_mass"]),
+        minimum_supported_run_weight=float(
+            settings["acceptance"].get("minimum_supported_run_weight", 0.01)
+        ),
+        maximum_timing_offset_sigma=float(
+            settings["acceptance"]["maximum_timing_offset_sigma"]
+        ),
+        maximum_timing_offset_tail_mass=float(
+            settings["acceptance"]["maximum_timing_offset_tail_mass"]
+        ),
     )
     return JointFitRequest(
         observations=observations,

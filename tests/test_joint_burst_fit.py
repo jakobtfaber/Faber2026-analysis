@@ -25,6 +25,7 @@ from radio_pipeline.fitting.joint_burst import (
     _layout,
     _log_likelihood,
     _mixture_edge_mass,
+    _run_gate_reasons,
     _structured_residual_correlation,
     fit_joint_event,
 )
@@ -33,6 +34,7 @@ from scattering.scat_analysis.burstfit import (
 )
 from scripts.fit_one_event_joint_burst import (
     _arrays_sha256,
+    _dsa_product_dm_bounds,
     _require_accepted_status,
     _require_locked_array_identity,
     _require_locked_product_metadata,
@@ -268,6 +270,132 @@ def test_independent_residual_dm_identity_is_required() -> None:
         DispersionState(100.0, 0.1, 0.2, 100.4, "bad")
 
 
+def test_dsa_product_dm_bound_is_a_uniform_nuisance_not_a_gaussian() -> None:
+    request = _request()
+    dsa = request.observations[1]
+    bounded = replace(
+        dsa,
+        dispersion=replace(
+            dsa.dispersion,
+            product_dm_bounds_pc_cm3=(100.08, 100.12),
+            product_dm_bound_source="v3_inferred_value",
+        ),
+    )
+    bounded_request = replace(request, observations=(request.observations[0], bounded))
+    layout = _layout(
+        bounded_request,
+        bounded_request.associations[0],
+        "gaussian",
+    )
+    nuisance = next(
+        parameter
+        for parameter in layout.parameters
+        if parameter.name == "product_dm_dsa_pc_cm3"
+    )
+    assert nuisance.kind == "uniform"
+    assert (nuisance.low, nuisance.high) == (100.08, 100.12)
+    assert "chime" not in layout.product_dm_names
+
+
+def test_dsa_input_interval_propagates_through_exactly_one_correction() -> None:
+    config = {
+        "dsa": {
+            "accepted_reference_dm_pc_cm3": 396.882,
+            "input_dm_pc_cm3": 396.989,
+            "input_dm_method": "inferred_raw_reference_row_timing",
+            "reference_minus_raw_dm_pc_cm3": -0.107,
+            "reference_minus_raw_dm_interval_pc_cm3": [-0.123, -0.091],
+        }
+    }
+    product_dm = 397.04
+    expected_raw_bounds = (396.882 - (-0.091), 396.882 - (-0.123))
+    assert _dsa_product_dm_bounds(config, product_dm) == pytest.approx(
+        (
+            product_dm + expected_raw_bounds[0] - 396.989,
+            product_dm + expected_raw_bounds[1] - 396.989,
+        )
+    )
+
+
+def test_dsa_bound_only_mode_propagates_offset_from_commanded_product() -> None:
+    config = {
+        "dsa": {
+            "accepted_reference_dm_pc_cm3": 100.0,
+            "input_dm_pc_cm3": 100.0,
+            "input_dm_method": "accepted_product_dm_nominal_with_residual_bound",
+            "reference_minus_raw_dm_pc_cm3": 0.04,
+            "reference_minus_raw_dm_interval_pc_cm3": [0.03, 0.05],
+        }
+    }
+    assert _dsa_product_dm_bounds(config, 101.0) == pytest.approx((100.95, 100.97))
+
+
+def test_bounded_physical_product_dm_need_not_contain_commanded_coordinate() -> None:
+    state = DispersionState(
+        100.0,
+        0.0,
+        1.0,
+        101.0,
+        "audited_filterbank_state_plus_fractional_residual",
+        product_dm_bounds_pc_cm3=(100.95, 100.97),
+        product_dm_bound_source="accepted-reference residual bound",
+    )
+    assert state.product_dm_pc_cm3 > state.product_dm_bounds_pc_cm3[1]
+
+
+def test_dsa_without_a_reviewed_bound_remains_exact() -> None:
+    assert (
+        _dsa_product_dm_bounds(
+            {"dsa": {"accepted_reference_dm_pc_cm3": 491.211}},
+            491.28,
+        )
+        is None
+    )
+
+
+def test_dsa_product_dm_uncertainty_is_propagated_in_likelihood() -> None:
+    request = _request()
+    nominal = request.observations[1]
+    actual_product_dm = 100.11
+    generated = _observation(
+        "dsa",
+        nominal.frequency_mhz,
+        nominal.sample_interval_s,
+        actual_product_dm,
+        request.geometry.site_delay_s["dsa"],
+    )
+    dsa = replace(
+        generated,
+        dispersion=replace(
+            nominal.dispersion,
+            product_dm_bounds_pc_cm3=(100.08, 100.12),
+            product_dm_bound_source="v3_inferred_value",
+        ),
+    )
+    varied = replace(request, observations=(request.observations[0], dsa))
+    layout = _layout(varied, varied.associations[0], "gaussian")
+    values = {
+        "absolute_dm_pc_cm3": TRUE_DM,
+        "toa_pulse1_s": TRUE_TOA_S,
+        "width_pulse1_s": 4.0e-4,
+        "width_index_pulse1": -0.2,
+        "timing_error_chime_s": 0.0,
+        "timing_error_dsa_s": 0.0,
+        "product_dm_dsa_pc_cm3": actual_product_dm,
+    }
+    truth = np.asarray([values[item.name] for item in layout.parameters])
+    wrong = truth.copy()
+    wrong[layout.parameters.index(next(
+        item for item in layout.parameters if item.name == "product_dm_dsa_pc_cm3"
+    ))] = 100.08
+    assert _log_likelihood(truth, varied, layout, "gaussian") > _log_likelihood(
+        wrong,
+        varied,
+        layout,
+        "gaussian",
+    )
+
+
 def test_reference_frequency_and_uncertainty_fail_closed() -> None:
     request = _request()
     chime = request.observations[0]
@@ -279,6 +407,38 @@ def test_reference_frequency_and_uncertainty_fail_closed() -> None:
             site_delay_sigma_s={"chime": 0.0, "dsa": 1.0e-8},
             clock_sigma_s={"chime": 0.0, "dsa": 1.0e-8},
         )
+
+
+def test_clock_uncertainty_reconciles_nominally_disjoint_matched_windows() -> None:
+    request = _request()
+    per_site_sigma = 1.0e-3
+    geometry = replace(
+        request.geometry,
+        site_delay_sigma_s={"chime": per_site_sigma, "dsa": per_site_sigma},
+        clock_sigma_s={"chime": 1.0e-12, "dsa": 1.0e-12},
+    )
+    differential_sigma = np.sqrt(2.0) * per_site_sigma
+    chime, dsa = request.components
+    chime_bounds = joint_module._component_geocentric_bounds(request, chime)
+    dsa_half_width = dsa.half_width_samples * request.observations[1].sample_interval_s
+    target_dsa_low = chime_bounds[1] + 1.4 * differential_sigma
+    target_dsa_center = target_dsa_low + dsa_half_width
+    dsa_center_sample = (
+        target_dsa_center
+        + request.geometry.site_delay_s["dsa"]
+    ) / request.observations[1].sample_interval_s
+    shifted = replace(
+        request,
+        geometry=geometry,
+        components=(chime, replace(dsa, center_sample=dsa_center_sample)),
+    )
+    layout = _layout(shifted, shifted.associations[0], "gaussian")
+    toa = next(parameter for parameter in layout.parameters if parameter.name == "toa_pulse1_s")
+    assert toa.low == pytest.approx(chime_bounds[0])
+    assert toa.high > target_dsa_low
+    diagnostic = joint_module._matched_window_diagnostics(shifted)["c1-d1:pulse1"]
+    assert diagnostic["nominal_windows_overlap"] is False
+    assert diagnostic["nominal_gap_sigma"] == pytest.approx(1.4)
 
 
 def test_request_rejects_duplicate_observation_entries() -> None:
@@ -336,13 +496,26 @@ def test_authoritative_frequency_and_support_identities_fail_on_drift() -> None:
 def test_crop_origin_and_off_pulse_support_fail_on_drift() -> None:
     mask = np.zeros((2, 16), dtype=bool)
     mask[:, :4] = True
+    waterfall = np.zeros((2, 16))
+    noise_std = np.ones((2, 16))
+    sample_interval_s = 1.0e-4
+    time0_unix_ns = 1_700_000_000_000_000_123
+    time_axis_ns = time0_unix_ns + np.rint(
+        np.arange(16) * sample_interval_s * 1.0e9
+    ).astype(np.int64)
     resolution = {
-        "chime_time0_unix_ns": 1_700_000_000_000_000_123,
+        "chime_time0_unix_ns": time0_unix_ns,
         "chime_off_pulse_mask_sha256": _arrays_sha256(mask),
+        "chime_waterfall_sha256": _arrays_sha256(waterfall),
+        "chime_noise_std_sha256": _arrays_sha256(noise_std),
+        "chime_time_axis_sha256": _arrays_sha256(time_axis_ns),
     }
     product = {
         "time0_unix_ns": np.asarray(resolution["chime_time0_unix_ns"], dtype=np.int64),
         "noise_estimation_mask": mask,
+        "waterfall": waterfall,
+        "noise_std": noise_std,
+        "sample_interval_s": np.asarray(sample_interval_s),
     }
     _require_locked_product_metadata(product, "chime", resolution)
     shifted = dict(product)
@@ -475,6 +648,80 @@ def test_edge_mass_detects_boundary_posterior_with_interior_median() -> None:
     ) == pytest.approx(0.2)
 
 
+def test_grossly_inconsistent_matched_windows_fail_run_gate() -> None:
+    request = _request()
+    shifted = replace(
+        request,
+        components=(
+            request.components[0],
+            replace(request.components[1], center_sample=70.0),
+        ),
+    )
+    theta, layout = _theta(shifted, TRUE_DM)
+    run = HypothesisFit(
+        morphology="gaussian",
+        association=shifted.associations[0].name,
+        parameter_names=tuple(item.name for item in layout.parameters),
+        samples=np.repeat(theta[None, :], 4, axis=0),
+        sample_weights=np.full(4, 0.25),
+        log_evidence=0.0,
+        log_evidence_error=0.1,
+        diagnostics={
+            "prior_rail_parameters": [],
+            "bands": {
+                "chime": {
+                    "reduced_residual_power": 1.0,
+                    "structured_frequency_time_correlation": 0.0,
+                },
+                "dsa": {
+                    "reduced_residual_power": 1.0,
+                    "structured_frequency_time_correlation": 0.0,
+                },
+            },
+        },
+    )
+    assert "timing_inconsistent" in _run_gate_reasons(shifted, run)
+
+
+def test_bimodal_timing_tail_cannot_hide_behind_zero_median() -> None:
+    request = _request()
+    theta, layout = _theta(request, TRUE_DM)
+    samples = np.repeat(theta[None, :], 4, axis=0)
+    sigma = np.hypot(
+        request.geometry.site_delay_sigma_s["chime"],
+        request.geometry.clock_sigma_s["chime"],
+    )
+    for instrument in ("chime", "dsa"):
+        index = tuple(item.name for item in layout.parameters).index(
+            f"timing_error_{instrument}_s"
+        )
+        samples[:, index] = np.asarray([-6.0, 0.0, 0.0, 6.0]) * sigma
+    run = HypothesisFit(
+        morphology="gaussian",
+        association=request.associations[0].name,
+        parameter_names=tuple(item.name for item in layout.parameters),
+        samples=samples,
+        sample_weights=np.asarray([0.49, 0.01, 0.01, 0.49]),
+        log_evidence=0.0,
+        log_evidence_error=0.1,
+        diagnostics={
+            "prior_rail_parameters": [],
+            "bands": {
+                instrument: {
+                    "reduced_residual_power": 1.0,
+                    "structured_frequency_time_correlation": 0.0,
+                }
+                for instrument in ("chime", "dsa")
+            },
+        },
+    )
+    assert "timing_inconsistent" in _run_gate_reasons(request, run)
+    assert run.diagnostics["posterior_timing_offset_sigma"]["chime"] == pytest.approx(0.0)
+    assert run.diagnostics["posterior_timing_offset_tail_mass"]["chime"] == pytest.approx(
+        0.98
+    )
+
+
 def test_failed_fit_status_exits_fail_closed() -> None:
     with pytest.raises(RuntimeError, match="failed_dm_edge"):
         _require_accepted_status("failed_dm_edge")
@@ -554,121 +801,104 @@ def test_association_evidence_selects_or_preserves_ambiguity(
     )
 
 
-def _fit_with_rejected_candidate(
+def test_negligible_rejected_run_does_not_poison_supported_result(
     monkeypatch: pytest.MonkeyPatch,
-    rejected_log_evidence: float,
-    rejected_log_evidence_error: float = 0.1,
-):
+) -> None:
     request = _request()
-    second_chime = replace(
-        request.components[0],
-        component_id="c2",
-        center_sample=request.components[0].center_sample + 3.0,
-    )
-    request = replace(
-        request,
-        components=request.components + (second_chime,),
-        associations=(
-            request.associations[0],
-            AssociationHypothesis(
-                "rejected",
-                (ComponentMatch("pulse1", "c2", "d1"),),
-            ),
+    associations = (
+        request.associations[0],
+        AssociationHypothesis(
+            "alternate",
+            (ComponentMatch("pulse1", "c1", "d1"),),
         ),
     )
+    request = replace(request, associations=associations)
 
     def fake_fit(request, hypothesis, morphology):
         layout = _layout(request, hypothesis, morphology)
-        sample = []
-        for parameter in layout.parameters:
-            if parameter.kind == "normal":
-                sample.append(0.0)
-            elif parameter.kind == "log_uniform":
-                sample.append(np.sqrt(parameter.low * parameter.high))
-            else:
-                sample.append((parameter.low + parameter.high) / 2.0)
-        rejected = hypothesis.name == "rejected"
+        sample = np.asarray([
+            0.0
+            if parameter.kind == "normal"
+            else np.sqrt(parameter.low * parameter.high)
+            if parameter.kind == "log_uniform"
+            else (parameter.low + parameter.high) / 2.0
+            for parameter in layout.parameters
+        ])
+        rejected = hypothesis.name == "alternate"
         return HypothesisFit(
             morphology=morphology,
             association=hypothesis.name,
             parameter_names=tuple(parameter.name for parameter in layout.parameters),
-            samples=np.asarray([sample]),
+            samples=sample[None, :],
             sample_weights=np.asarray([1.0]),
-            log_evidence=rejected_log_evidence if rejected else 10.0,
-            log_evidence_error=rejected_log_evidence_error if rejected else 0.1,
+            log_evidence=-10.0 if rejected else 0.0,
+            log_evidence_error=0.1,
             diagnostics={
                 "bands": {
                     instrument: {
-                        "reduced_residual_power": 99.0 if rejected else 1.0,
+                        "reduced_residual_power": 1.0,
                         "structured_frequency_time_correlation": 0.0,
                     }
                     for instrument in ("chime", "dsa")
                 },
-                "prior_rail_parameters": ["rejected_only"] if rejected else [],
+                "prior_rail_parameters": ["width_pulse1_s"] if rejected else [],
             },
         )
 
     monkeypatch.setattr(joint_module, "_fit_one", fake_fit)
-    return fit_joint_event(request)
+    result = fit_joint_event(request)
+    assert result.status == "provisional_pending_owner_approval"
+    assert result.diagnostics["run_acceptance"]["gaussian:alternate"] == {
+        "evidence_supported": False,
+        "retained": False,
+        "rejection_reasons": ["prior_rail"],
+    }
+    assert result.diagnostics["raw_evidence_weights"]["gaussian:alternate"] > 0
+    assert result.diagnostics["run_weights"]["gaussian:alternate"] == 0.0
 
 
-def test_negligible_candidate_diagnostics_do_not_poison_mixture(
+def test_fit_fails_when_no_evidence_supported_run_is_acceptable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    selected = _fit_with_rejected_candidate(monkeypatch, rejected_log_evidence=-100.0)
+    request = _request()
 
-    assert selected.status == "provisional_pending_owner_approval"
-    assert selected.diagnostics["maximum_reduced_residual_power"] == 1.0
-    assert selected.diagnostics["prior_rail_parameters"] == []
-
-
-def test_equal_weight_candidate_diagnostics_remain_plausible(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    selected = _fit_with_rejected_candidate(monkeypatch, rejected_log_evidence=10.0)
-
-    assert selected.status == "failed_prior_rail"
-    assert selected.diagnostics["maximum_reduced_residual_power"] == 99.0
-    assert selected.diagnostics["prior_rail_parameters"] == ["rejected_only"]
-
-
-def test_four_point_nine_percent_candidate_remains_plausible(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    rejected_log_evidence = 10.0 + np.log(0.049 / 0.951)
-    selected = _fit_with_rejected_candidate(
-        monkeypatch,
-        rejected_log_evidence=rejected_log_evidence,
-    )
-
-    assert selected.status == "failed_prior_rail"
-    assert selected.diagnostics["prior_rail_parameters"] == ["rejected_only"]
-
-
-def test_large_evidence_error_keeps_low_point_weight_candidate_plausible(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    selected = _fit_with_rejected_candidate(
-        monkeypatch,
-        rejected_log_evidence=-100.0,
-        rejected_log_evidence_error=100.0,
-    )
-
-    assert selected.status == "failed_prior_rail"
-    assert selected.diagnostics["prior_rail_parameters"] == ["rejected_only"]
-
-
-@pytest.mark.parametrize("error", [-0.1, np.nan, np.inf])
-def test_invalid_log_evidence_error_fails_closed(
-    monkeypatch: pytest.MonkeyPatch,
-    error: float,
-) -> None:
-    with pytest.raises(ValueError, match="evidence errors"):
-        _fit_with_rejected_candidate(
-            monkeypatch,
-            rejected_log_evidence=-100.0,
-            rejected_log_evidence_error=error,
+    def fake_fit(request, hypothesis, morphology):
+        layout = _layout(request, hypothesis, morphology)
+        sample = np.asarray([
+            0.0
+            if parameter.kind == "normal"
+            else np.sqrt(parameter.low * parameter.high)
+            if parameter.kind == "log_uniform"
+            else (parameter.low + parameter.high) / 2.0
+            for parameter in layout.parameters
+        ])
+        return HypothesisFit(
+            morphology=morphology,
+            association=hypothesis.name,
+            parameter_names=tuple(parameter.name for parameter in layout.parameters),
+            samples=sample[None, :],
+            sample_weights=np.asarray([1.0]),
+            log_evidence=0.0,
+            log_evidence_error=0.1,
+            diagnostics={
+                "bands": {
+                    instrument: {
+                        "reduced_residual_power": 3.0,
+                        "structured_frequency_time_correlation": 0.0,
+                    }
+                    for instrument in ("chime", "dsa")
+                },
+                "prior_rail_parameters": [],
+            },
         )
+
+    monkeypatch.setattr(joint_module, "_fit_one", fake_fit)
+    result = fit_joint_event(request)
+    assert result.status == "failed_model_inadequate"
+    acceptance = result.diagnostics["run_acceptance"]["gaussian:c1-d1"]
+    assert acceptance["evidence_supported"] is True
+    assert acceptance["retained"] is False
+    assert acceptance["rejection_reasons"] == ["model_inadequate"]
 
 
 def test_exponential_kernel_matches_legacy_kernel() -> None:

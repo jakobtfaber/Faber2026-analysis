@@ -53,6 +53,8 @@ class DispersionState:
     incoherent_correction_pc_cm3: float
     product_dm_pc_cm3: float
     mode: str
+    product_dm_bounds_pc_cm3: tuple[float, float] | None = None
+    product_dm_bound_source: str | None = None
 
     def __post_init__(self) -> None:
         expected = (
@@ -71,6 +73,15 @@ class DispersionState:
             )
         if not self.mode:
             raise ValueError("dispersion mode is required")
+        if self.product_dm_bounds_pc_cm3 is None:
+            if self.product_dm_bound_source is not None:
+                raise ValueError("exact product DM cannot name an uncertainty source")
+        else:
+            low, high = map(float, self.product_dm_bounds_pc_cm3)
+            if not np.isfinite([low, high]).all() or not low < high:
+                raise ValueError("product DM uncertainty bounds must be finite and ordered")
+            if not self.product_dm_bound_source:
+                raise ValueError("bounded product DM requires an uncertainty source")
 
 
 @dataclass(slots=True)
@@ -252,6 +263,9 @@ class FitSettings:
     maximum_structured_residual_correlation: float = 0.2
     posterior_edge_fraction: float = 0.01
     maximum_prior_edge_mass: float = 0.05
+    minimum_supported_run_weight: float = 0.01
+    maximum_timing_offset_sigma: float = 5.0
+    maximum_timing_offset_tail_mass: float = 0.05
 
     def __post_init__(self) -> None:
         if not self.dm_bounds_pc_cm3[0] < self.dm_bounds_pc_cm3[1]:
@@ -274,6 +288,12 @@ class FitSettings:
             raise ValueError("posterior edge fraction must lie between zero and 0.5")
         if not 0 < self.maximum_prior_edge_mass < 0.5:
             raise ValueError("prior-edge mass threshold must lie between zero and 0.5")
+        if not 0 <= self.minimum_supported_run_weight < 1:
+            raise ValueError("supported-run weight threshold must lie in [0, 1)")
+        if self.maximum_timing_offset_sigma <= 0:
+            raise ValueError("timing-offset threshold must be positive")
+        if not 0 <= self.maximum_timing_offset_tail_mass < 1:
+            raise ValueError("timing-offset tail-mass threshold must lie in [0, 1)")
         if self.maximum_reduced_residual_power <= 0:
             raise ValueError("model-adequacy threshold must be positive")
         if not 0 < self.maximum_structured_residual_correlation < 1:
@@ -379,6 +399,7 @@ class _RunLayout:
     component_parameter_names: dict[tuple[str, str], tuple[str, str, str]]
     matched_toa_names: dict[str, str]
     timing_error_names: dict[str, str]
+    product_dm_names: dict[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,11 +474,12 @@ def _component_topocentric_bounds(
     return center - half_width, center + half_width
 
 
-def _intersect(left: tuple[float, float], right: tuple[float, float]) -> tuple[float, float]:
-    bounds = max(left[0], right[0]), min(left[1], right[1])
-    if not bounds[0] < bounds[1]:
-        raise ValueError("matched component ToA windows do not overlap in geocentric time")
-    return bounds
+def _matched_toa_bounds(
+    left: tuple[float, float], right: tuple[float, float]
+) -> tuple[float, float]:
+    """Cover both reviewed windows; Gaussian timing errors reconcile their offset."""
+
+    return min(left[0], right[0]), max(left[1], right[1])
 
 
 def _layout(
@@ -481,7 +503,7 @@ def _layout(
         toa_name = f"toa_{match.latent_id}_s"
         width_name = f"width_{match.latent_id}_s"
         index_name = f"width_index_{match.latent_id}"
-        toa_bounds = _intersect(
+        toa_bounds = _matched_toa_bounds(
             _component_geocentric_bounds(request, chime),
             _component_geocentric_bounds(request, dsa),
         )
@@ -549,6 +571,15 @@ def _layout(
         parameters.append(_Parameter(name, "normal", 0.0, sigma))
         timing_names[instrument] = name
 
+    product_dm_names: dict[str, str] = {}
+    for observation in request.observations:
+        bounds = observation.dispersion.product_dm_bounds_pc_cm3
+        if bounds is None:
+            continue
+        name = f"product_dm_{observation.instrument}_pc_cm3"
+        parameters.append(_Parameter(name, "uniform", *bounds))
+        product_dm_names[observation.instrument] = name
+
     if morphology == "scattering":
         parameters.extend(
             (
@@ -569,6 +600,7 @@ def _layout(
         component_names,
         matched_toa_names,
         timing_names,
+        product_dm_names,
     )
 
 
@@ -613,7 +645,13 @@ def _component_kernels(
     evaluation_frequency = (
         frequency[:, None] + 0.5 * observation.channel_width_mhz[:, None] * response_node
     )
-    residual_dm = values["absolute_dm_pc_cm3"] - observation.dispersion.product_dm_pc_cm3
+    product_dm_name = layout.product_dm_names.get(observation.instrument)
+    product_dm = (
+        values[product_dm_name]
+        if product_dm_name is not None
+        else observation.dispersion.product_dm_pc_cm3
+    )
+    residual_dm = values["absolute_dm_pc_cm3"] - product_dm
     dispersion_delay = (
         K_DM_S_MHZ2 * residual_dm * (evaluation_frequency**-2 - REFERENCE_FREQUENCY_MHZ**-2)
     )
@@ -1101,39 +1139,104 @@ def _mixture_edge_mass(
     return mass
 
 
-def _plausible_runs(
-    runs: list[HypothesisFit],
-    selected_index: int,
-) -> tuple[list[HypothesisFit], NDArray[np.floating]]:
-    """Return every hypothesis that remains numerically plausible.
+def _run_gate_reasons(
+    request: JointFitRequest,
+    run: HypothesisFit,
+) -> list[str]:
+    reasons: list[str] = []
+    dm_index = run.parameter_names.index("absolute_dm_pc_cm3")
+    dm_values = run.samples[:, dm_index]
+    dm_summary = _weighted_quantiles(dm_values, run.sample_weights)
+    bounds = request.settings.dm_bounds_pc_cm3
+    fraction = request.settings.posterior_edge_fraction
+    margin = fraction * (bounds[1] - bounds[0])
+    median_at_edge = dm_summary[1] <= bounds[0] + margin or dm_summary[1] >= bounds[1] - margin
+    edge = (dm_values <= bounds[0] + margin) | (dm_values >= bounds[1] - margin)
+    edge_mass = float(np.sum(run.sample_weights[edge]))
+    run.diagnostics["dm_median_at_edge"] = bool(median_at_edge)
+    run.diagnostics["dm_edge_mass"] = edge_mass
+    if median_at_edge or edge_mass > request.settings.maximum_prior_edge_mass:
+        reasons.append("dm_edge")
+    if run.diagnostics["prior_rail_parameters"]:
+        reasons.append("prior_rail")
+    bands = run.diagnostics["bands"]
+    maximum_power = max(float(row["reduced_residual_power"]) for row in bands.values())
+    maximum_correlation = max(
+        abs(float(row["structured_frequency_time_correlation"])) for row in bands.values()
+    )
+    run.diagnostics["maximum_reduced_residual_power"] = maximum_power
+    run.diagnostics["maximum_structured_residual_correlation"] = maximum_correlation
+    if (
+        maximum_power > request.settings.maximum_reduced_residual_power
+        or maximum_correlation > request.settings.maximum_structured_residual_correlation
+    ):
+        reasons.append("model_inadequate")
+    matched_offsets = _matched_window_diagnostics(request)
+    association_prefix = f"{run.association}:"
+    nominal_gap_sigma = max(
+        float(row["nominal_gap_sigma"])
+        for key, row in matched_offsets.items()
+        if key.startswith(association_prefix)
+    )
+    timing_pulls: dict[str, float] = {}
+    timing_tail_mass: dict[str, float] = {}
+    for instrument in ("chime", "dsa"):
+        parameter = f"timing_error_{instrument}_s"
+        index = run.parameter_names.index(parameter)
+        values = run.samples[:, index]
+        median = _weighted_quantiles(values, run.sample_weights)[1]
+        sigma = math.hypot(
+            request.geometry.site_delay_sigma_s[instrument],
+            request.geometry.clock_sigma_s[instrument],
+        )
+        timing_pulls[instrument] = float(abs(median) / sigma)
+        timing_tail_mass[instrument] = float(
+            np.sum(
+                run.sample_weights[
+                    np.abs(values) > request.settings.maximum_timing_offset_sigma * sigma
+                ]
+            )
+        )
+    run.diagnostics["nominal_matched_window_gap_sigma"] = nominal_gap_sigma
+    run.diagnostics["posterior_timing_offset_sigma"] = timing_pulls
+    run.diagnostics["posterior_timing_offset_tail_mass"] = timing_tail_mass
+    if (
+        nominal_gap_sigma > request.settings.maximum_timing_offset_sigma
+        or max(timing_tail_mass.values())
+        > request.settings.maximum_timing_offset_tail_mass
+    ):
+        reasons.append("timing_inconsistent")
+    return reasons
 
-    For each run, its optimistic evidence is ``logZ + error`` while every
-    competitor uses ``logZ - error``. The run remains plausible when its
-    resulting normalized evidence weight exceeds float64 resolution. The
-    point-estimate winner is always retained. This is numerical, not a
-    scientific posterior-mass threshold.
-    """
 
-    log_evidence = np.asarray([run.log_evidence for run in runs], dtype=float)
-    errors = np.asarray([run.log_evidence_error for run in runs], dtype=float)
-    if np.any(~np.isfinite(log_evidence)):
-        raise ValueError("log evidences must be finite")
-    if np.any(~np.isfinite(errors)) or np.any(errors < 0):
-        raise ValueError("log evidence errors must be finite and nonnegative")
-    upper_weights = np.empty(len(runs), dtype=float)
-    for index in range(len(runs)):
-        shifted = log_evidence - errors
-        shifted[index] = log_evidence[index] + errors[index]
-        relative = shifted - np.max(shifted)
-        weights = np.exp(relative)
-        upper_weights[index] = weights[index] / weights.sum()
-    resolution = np.finfo(float).eps
-    plausible = [
-        run
-        for index, run in enumerate(runs)
-        if index == selected_index or upper_weights[index] > resolution
-    ]
-    return plausible, upper_weights
+def _matched_window_diagnostics(request: JointFitRequest) -> dict[str, dict[str, float | bool]]:
+    output: dict[str, dict[str, float | bool]] = {}
+    timing_sigma = {
+        instrument: math.hypot(
+            request.geometry.site_delay_sigma_s[instrument],
+            request.geometry.clock_sigma_s[instrument],
+        )
+        for instrument in ("chime", "dsa")
+    }
+    differential_sigma = math.hypot(timing_sigma["chime"], timing_sigma["dsa"])
+    for hypothesis in request.associations:
+        for match in hypothesis.matches:
+            chime = _component_geocentric_bounds(
+                request,
+                _component_by_key(request, "chime", match.chime_component_id),
+            )
+            dsa = _component_geocentric_bounds(
+                request,
+                _component_by_key(request, "dsa", match.dsa_component_id),
+            )
+            gap = float(max(chime[0] - dsa[1], dsa[0] - chime[1], 0.0))
+            output[f"{hypothesis.name}:{match.latent_id}"] = {
+                "nominal_windows_overlap": bool(gap == 0.0),
+                "nominal_gap_s": gap,
+                "differential_timing_sigma_s": float(differential_sigma),
+                "nominal_gap_sigma": float(gap / differential_sigma),
+            }
+    return output
 
 
 def fit_joint_event(request: JointFitRequest) -> JointFitResult:
@@ -1150,8 +1253,28 @@ def fit_joint_event(request: JointFitRequest) -> JointFitResult:
     ]
     log_evidence = np.asarray([run.log_evidence for run in runs])
     relative = log_evidence - np.max(log_evidence)
-    run_weights = np.exp(relative)
-    run_weights /= run_weights.sum()
+    raw_run_weights = np.exp(relative)
+    raw_run_weights /= raw_run_weights.sum()
+    gate_reasons = [_run_gate_reasons(request, run) for run in runs]
+    best_raw_index = int(np.argmax(raw_run_weights))
+    supported = [
+        bool(
+            index == best_raw_index
+            or weight >= request.settings.minimum_supported_run_weight
+        )
+        for index, weight in enumerate(raw_run_weights)
+    ]
+    retained = [
+        is_supported and not reasons
+        for is_supported, reasons in zip(supported, gate_reasons, strict=True)
+    ]
+    run_weights = np.zeros_like(raw_run_weights)
+    if any(retained):
+        run_weights[retained] = raw_run_weights[retained]
+        run_weights /= run_weights.sum()
+    else:
+        # Preserve a diagnostic posterior on failure, but never label it accepted.
+        run_weights = raw_run_weights.copy()
     dm = _mixture_quantiles(runs, run_weights, "absolute_dm_pc_cm3")
     latent_ids = sorted(
         {match.latent_id for hypothesis in request.associations for match in hypothesis.matches}
@@ -1198,6 +1321,27 @@ def fit_joint_event(request: JointFitRequest) -> JointFitResult:
             f"{run.morphology}:{run.association}": float(weight)
             for run, weight in zip(runs, run_weights, strict=True)
         },
+        "raw_evidence_weights": {
+            f"{run.morphology}:{run.association}": float(weight)
+            for run, weight in zip(runs, raw_run_weights, strict=True)
+        },
+        "run_acceptance": {
+            f"{run.morphology}:{run.association}": {
+                "evidence_supported": is_supported,
+                "retained": is_retained,
+                "rejection_reasons": reasons,
+            }
+            for run, is_supported, is_retained, reasons in zip(
+                runs,
+                supported,
+                retained,
+                gate_reasons,
+                strict=True,
+            )
+        },
+        "minimum_supported_run_weight": request.settings.minimum_supported_run_weight,
+        "retained_evidence_mass": float(np.sum(raw_run_weights[retained])),
+        "matched_window_offsets": _matched_window_diagnostics(request),
         "reference_frequency_mhz": REFERENCE_FREQUENCY_MHZ,
         "separate_native_grids": True,
         "independent_band_centroids_allowed": False,
@@ -1209,18 +1353,18 @@ def fit_joint_event(request: JointFitRequest) -> JointFitResult:
         hypothesis for hypothesis in request.associations if hypothesis.name == best_run.association
     )
     best_layout = _layout(request, best_hypothesis, best_run.morphology)
-    plausible_runs, plausible_upper_weights = _plausible_runs(
-        runs,
-        best_index,
-    )
+    accepted_runs = [run for run, keep in zip(runs, retained, strict=True) if keep]
+    diagnostic_runs = accepted_runs or [
+        run for run, keep in zip(runs, supported, strict=True) if keep
+    ]
     maximum_residual_power = max(
         float(band["reduced_residual_power"])
-        for run in plausible_runs
+        for run in diagnostic_runs
         for band in run.diagnostics["bands"].values()
     )
     maximum_structured_correlation = max(
         abs(float(band["structured_frequency_time_correlation"]))
-        for run in plausible_runs
+        for run in diagnostic_runs
         for band in run.diagnostics["bands"].values()
     )
     model_adequate = (
@@ -1228,32 +1372,55 @@ def fit_joint_event(request: JointFitRequest) -> JointFitResult:
         and maximum_structured_correlation
         <= request.settings.maximum_structured_residual_correlation
     )
-    prior_railed = sorted(
-        {name for run in plausible_runs for name in run.diagnostics["prior_rail_parameters"]}
-    )
+    prior_railed = sorted({
+        name
+        for run in diagnostic_runs
+        for name in run.diagnostics["prior_rail_parameters"]
+    })
+    product_dm_priors = {}
+    product_dm_posteriors = {}
+    for observation in request.observations:
+        bounds = observation.dispersion.product_dm_bounds_pc_cm3
+        product_dm_priors[observation.instrument] = {
+            "kind": "uniform_bound" if bounds is not None else "exact",
+            "nominal_pc_cm3": observation.dispersion.product_dm_pc_cm3,
+            "bounds_pc_cm3": list(bounds) if bounds is not None else None,
+            "source": observation.dispersion.product_dm_bound_source,
+        }
+        parameter = f"product_dm_{observation.instrument}_pc_cm3"
+        if bounds is not None:
+            product_dm_posteriors[observation.instrument] = _mixture_quantiles(
+                runs,
+                run_weights,
+                parameter,
+            )
     diagnostics.update(
         {
             "maximum_reduced_residual_power": maximum_residual_power,
             "maximum_structured_residual_correlation": (maximum_structured_correlation),
             "model_adequate": model_adequate,
             "prior_rail_parameters": prior_railed,
-            "plausible_runs": [
-                f"{run.morphology}:{run.association}" for run in plausible_runs
-            ],
-            "plausible_run_upper_weights": {
-                f"{run.morphology}:{run.association}": float(weight)
-                for run, weight in zip(runs, plausible_upper_weights, strict=True)
-            },
-            "plausible_run_weight_resolution": float(np.finfo(float).eps),
+            "product_dm_priors": product_dm_priors,
+            "product_dm_posteriors": product_dm_posteriors,
             "fixed_valid_pixel_masks": True,
         }
     )
-    if edge:
+    supported_reasons = [
+        reason
+        for is_supported, reasons in zip(supported, gate_reasons, strict=True)
+        if is_supported
+        for reason in reasons
+    ]
+    if not any(retained) and "dm_edge" in supported_reasons:
         status = "failed_dm_edge"
-    elif prior_railed:
+    elif not any(retained) and "prior_rail" in supported_reasons:
         status = "failed_prior_rail"
-    elif not model_adequate:
+    elif not any(retained) and "timing_inconsistent" in supported_reasons:
+        status = "failed_timing_inconsistent"
+    elif not any(retained):
         status = "failed_model_inadequate"
+    elif edge:
+        status = "failed_dm_edge"
     else:
         status = "provisional_pending_owner_approval"
     return JointFitResult(
