@@ -219,7 +219,17 @@ def test_ready_schema_requires_science_array_hashes(tmp_path: Path) -> None:
             "status": "ready",
             "execution_authorized": True,
             "blockers": [],
-            "components": [{}, {}],
+            "components": [
+                {
+                    "instrument": instrument,
+                    "component_id": f"{instrument}_c1",
+                    "center_sample": 4.0,
+                    "half_width_samples": 2.0,
+                    "width_bounds_s": [1.0e-5, 1.0e-3],
+                    "width_index_bounds": [-2.0, 2.0],
+                }
+                for instrument in ("chime", "dsa")
+            ],
             "associations": joint_fit["review_plan"]["association_hypotheses"],
             "dm_bounds_pc_cm3": [491.0, 491.5],
             "morphologies": ["gaussian"],
@@ -308,8 +318,19 @@ def _approved_transition_inputs(tmp_path: Path) -> tuple[dict, dict, dict]:
         "event_binding_sha256": config["event_binding_sha256"],
         "review_plan": copy.deepcopy(config["joint_fit"]["review_plan"]),
         "observation_contracts": {
-            "chime": {"sample_interval_s": 2.56e-6},
-            "dsa": {"sample_interval_s": 2.56e-6},
+            instrument: {
+                "sample_interval_s": resolution[
+                    f"{instrument}_sample_interval_s"
+                ],
+                "shape": resolution[f"{instrument}_shape"],
+                "frequency_grid_sha256": resolution[
+                    f"{instrument}_frequency_grid_sha256"
+                ],
+                "valid_mask_sha256": resolution[
+                    f"{instrument}_valid_mask_sha256"
+                ],
+            }
+            for instrument in ("chime", "dsa")
         },
         "components": components,
         "associations": copy.deepcopy(
@@ -398,6 +419,46 @@ def test_review_decision_rejects_source_identity_drift(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="source_event_binding_sha256"):
         apply_review_decision(
             changed,
+            decision,
+            component_proposal=proposal,
+            component_proposal_sha256="1" * 64,
+            resolution_proposal=resolution,
+            resolution_proposal_sha256="2" * 64,
+        )
+
+
+@pytest.mark.parametrize("center_sample", [-1.0, 10_000.0])
+def test_review_decision_rejects_component_outside_fit_grid(
+    tmp_path: Path,
+    center_sample: float,
+) -> None:
+    config, proposal, decision = _approved_transition_inputs(tmp_path)
+    proposal["components"][0]["center_sample"] = center_sample
+    resolution = copy.deepcopy(decision["resolution_lock"])
+    resolution["status"] = "pending_owner_review"
+    resolution["crop_and_off_pulse_padding_locked"] = False
+
+    with pytest.raises(ValueError, match="outside the approved fit grid"):
+        apply_review_decision(
+            config,
+            decision,
+            component_proposal=proposal,
+            component_proposal_sha256="1" * 64,
+            resolution_proposal=resolution,
+            resolution_proposal_sha256="2" * 64,
+        )
+
+
+def test_review_decision_rejects_components_from_another_grid(tmp_path: Path) -> None:
+    config, proposal, decision = _approved_transition_inputs(tmp_path)
+    proposal["observation_contracts"]["chime"]["shape"][1] += 1
+    resolution = copy.deepcopy(decision["resolution_lock"])
+    resolution["status"] = "pending_owner_review"
+    resolution["crop_and_off_pulse_padding_locked"] = False
+
+    with pytest.raises(ValueError, match="another fit grid"):
+        apply_review_decision(
+            config,
             decision,
             component_proposal=proposal,
             component_proposal_sha256="1" * 64,

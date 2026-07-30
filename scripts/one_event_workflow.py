@@ -411,7 +411,7 @@ def apply_review_decision(
             "review_decision": {
                 "status": "approved",
                 **expected_identity,
-                "components_sha256": _payload_sha256(components),
+                "components_sha256": _payload_sha256(reviewed_components),
                 "associations_sha256": _payload_sha256(associations),
                 "approved_resolution_sha256": _payload_sha256(approved_resolution),
                 "reviewer": decision["reviewer"],
