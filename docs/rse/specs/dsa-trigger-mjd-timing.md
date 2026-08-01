@@ -120,6 +120,31 @@ must not be substituted for that mapping.
   independent end-to-end check of the whole chain; it is not used as an anchor
   for any value in this note.
 
+## Casey downstream claim boundary
+
+The value 491.27737153955155 pc cm⁻³ is a coherent-power and
+relative-dispersion diagnostic. It does not depend on the absolute
+CHIME/FRB–DSA-110 time origins and remains pending independent and owner review.
+The value 491.27924166266934 pc cm⁻³ is only a conditional geometry-alignment
+sensitivity under the assumption that the recovered trigger epoch is the
+DSA-110 burst arrival time; it has no formal uncertainty and is not a formal
+dispersion-measure result.
+
+The sole executed Casey joint absolute-timing fit used the rounded filterbank
+`tstart` plus crop as its DSA-110 origin, producing an approximately 11.5583 s
+origin displacement; the fit diagnostic records a nominal window gap of
+11.55608945970681 s. Its `fit-result.json` has SHA-256
+`7e88c030152b5b967c28be4d0fc9a3a219b199fcf6438f3272e916c2716846a8`, status
+`failed_prior_rail`, and model and timing failures. The associated resolution
+packet inherits that origin and contains no fit. Raw-only and exact-time
+diagnostic packets avoid the numeric displacement through analysis-derived
+trigger-to-peak assignments, but lack the producer mapping and contain no
+traceable fit result. The legacy fixed-DM crossmatch is unverified.
+
+No existing Casey product supplies a formally quotable geometry-matching DM or
+geocentric 400 MHz TOA. These failures do not invalidate the relative or
+coherent-power diagnostic above.
+
 ## Source evidence and durable artifacts
 
 The current trigger-time authority is

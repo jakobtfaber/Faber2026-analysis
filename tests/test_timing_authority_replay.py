@@ -316,6 +316,34 @@ def test_documented_trigger_authority_is_canonical_and_hash_bound() -> None:
     assert "The rounded `tstart` header must not be substituted" in normalized_document
 
 
+def test_documented_casey_claim_boundary_preserves_relative_diagnostics_only() -> None:
+    document = (
+        Path(__file__).parents[1] / "docs/rse/specs/dsa-trigger-mjd-timing.md"
+    ).read_text()
+    normalized_document = " ".join(document.split())
+    assert "491.27737153955155" in normalized_document
+    assert "coherent-power and relative-dispersion diagnostic" in normalized_document
+    assert "pending independent and owner review" in normalized_document
+    assert "491.27924166266934" in normalized_document
+    assert "conditional geometry-alignment sensitivity" in normalized_document
+    assert "no formal uncertainty" in normalized_document
+    assert "sole executed Casey joint absolute-timing fit" in normalized_document
+    assert "approximately 11.5583 s origin displacement" in normalized_document
+    assert "11.55608945970681" in normalized_document
+    assert "7e88c030152b5b967c28be4d0fc9a3a219b199fcf6438f3272e916c2716846a8" in (
+        normalized_document
+    )
+    assert "failed_prior_rail" in normalized_document
+    assert "resolution packet inherits that origin and contains no fit" in normalized_document
+    assert "lack the producer mapping and contain no traceable fit result" in normalized_document
+    assert "legacy fixed-DM crossmatch is unverified" in normalized_document
+    assert "No existing Casey product supplies a formally quotable geometry-matching DM" in (
+        normalized_document
+    )
+    assert "geocentric 400 MHz TOA" in normalized_document
+    assert "do not invalidate the relative or coherent-power diagnostic" in normalized_document
+
+
 @pytest.mark.external_data
 def test_documented_trigger_authority_resolves_and_matches_hash() -> None:
     authority = (
