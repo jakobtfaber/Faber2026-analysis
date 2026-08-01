@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
-import subprocess
+import platform
+import sys
 import tempfile
+import warnings
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -18,6 +21,7 @@ from one_event_workflow import load_config
 
 K_DM_S_MHZ2 = 4148.808
 REFERENCE_FREQUENCY_MHZ = 400.0
+RUNTIME_PACKAGES = ("astropy", "blimpy", "h5py", "jsonschema", "numpy", "pytest")
 
 
 def sha256_file(path: Path) -> str:
@@ -26,6 +30,63 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _verify_execution_context(
+    repo_root: Path,
+    config_path: Path,
+    candidate_manifest_path: Path,
+    environment_receipt_path: Path,
+) -> dict:
+    manifest = json.loads(candidate_manifest_path.read_text())
+    expected_paths = manifest.get("paths")
+    if not isinstance(expected_paths, dict) or not expected_paths:
+        raise RuntimeError("candidate manifest lacks bound paths")
+    for relative, expected_hash in expected_paths.items():
+        if sha256_file(repo_root / relative) != expected_hash:
+            raise RuntimeError(f"candidate manifest path changed: {relative}")
+    required_controls = {
+        str(config_path.resolve().relative_to(repo_root.resolve())),
+        "analysis-configs/absolute-dm/schema.json",
+        "radio_pipeline/fitting/products.py",
+        "scripts/audit_one_event_dsa_state_h17.py",
+        "scripts/build_one_event_dsa_hybrid_h17.py",
+        "scripts/one_event_workflow.py",
+        "scripts/replay_one_event_timing_authorities.py",
+    }
+    if not required_controls.issubset(expected_paths):
+        raise RuntimeError("candidate manifest omits timing control paths")
+    environment = json.loads(environment_receipt_path.read_text())
+    runtime = environment.get("h17")
+    if not isinstance(runtime, dict):
+        raise RuntimeError("environment receipt lacks h17 runtime")
+    if Path(runtime.get("python_executable", "")).resolve() != Path(sys.executable).resolve():
+        raise RuntimeError("runtime Python differs from environment receipt")
+    if runtime.get("python_version") != platform.python_version():
+        raise RuntimeError("runtime Python version differs from environment receipt")
+    expected_packages = runtime.get("packages")
+    if not isinstance(expected_packages, dict):
+        raise RuntimeError("environment receipt lacks package versions")
+    for package in RUNTIME_PACKAGES:
+        if expected_packages.get(package) != importlib.metadata.version(package):
+            raise RuntimeError(f"runtime package differs from environment receipt: {package}")
+    locks = environment.get("locks")
+    if not isinstance(locks, dict):
+        raise RuntimeError("environment receipt lacks lock identities")
+    for name in ("pyproject.toml", "uv.lock"):
+        if sha256_file(repo_root / name) != locks.get(f"{name}_sha256"):
+            raise RuntimeError(f"runtime lock differs from environment receipt: {name}")
+    return {
+        "candidate_manifest": str(candidate_manifest_path.resolve()),
+        "candidate_manifest_sha256": sha256_file(candidate_manifest_path),
+        "candidate_diff_sha256": manifest["candidate_diff_sha256"],
+        "base_commit": manifest["base_commit"],
+        "environment_receipt": str(environment_receipt_path.resolve()),
+        "environment_receipt_sha256": sha256_file(environment_receipt_path),
+        "python_executable": sys.executable,
+        "python_version": platform.python_version(),
+        "packages": {name: importlib.metadata.version(name) for name in RUNTIME_PACKAGES},
+    }
 
 
 def recover_trigger(entry: dict) -> dict:
@@ -102,7 +163,37 @@ def audit_chime(path: Path) -> dict:
         }
 
 
-def audit_dsa(path: Path, trigger_entry: dict) -> dict:
+def _dsa_peak_sample(reader: object, accepted_reference_path: Path) -> int:
+    values = np.asarray(reader.data[:, 0, :], dtype=float).T
+    reference = np.load(accepted_reference_path)
+    if reference.ndim != 2 or reference.shape[0] != values.shape[0]:
+        raise RuntimeError("accepted DSA support does not match the filterbank channels")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        reference_std = np.nanstd(reference, axis=1)
+    accepted_live = np.isfinite(reference_std) & (reference_std > 0)
+    quarter = values.shape[1] // 4
+    if quarter < 8:
+        raise RuntimeError("DSA filterbank is too short for a robust peak audit")
+    off_pulse = np.concatenate((values[:, :quarter], values[:, -quarter:]), axis=1)
+    baseline = np.nanmedian(off_pulse, axis=1)
+    mad = np.nanmedian(np.abs(off_pulse - baseline[:, None]), axis=1)
+    live = accepted_live & np.isfinite(baseline) & np.isfinite(mad) & (mad > 0)
+    if int(live.sum()) < 8:
+        raise RuntimeError("DSA filterbank has insufficient live channels for a peak audit")
+    normalized = (values[live] - baseline[live, None]) / (1.4826 * mad[live, None])
+    profile = np.nanmean(normalized, axis=0)
+    if not np.any(np.isfinite(profile)):
+        raise RuntimeError("DSA filterbank peak profile is non-finite")
+    return int(np.nanargmax(profile))
+
+
+def audit_dsa(
+    path: Path,
+    trigger_entry: dict,
+    time_origin: dict | None = None,
+    accepted_reference_path: Path | None = None,
+) -> dict:
     from blimpy import Waterfall
 
     replay = recover_trigger(trigger_entry)
@@ -113,12 +204,12 @@ def audit_dsa(path: Path, trigger_entry: dict) -> dict:
     if trigger_entry.get("status") != "VERIFIED":
         raise RuntimeError("DSA trigger authority is not verified")
 
-    reader = Waterfall(str(path), load_data=False)
+    reader = Waterfall(str(path), load_data=time_origin is not None)
     header_tstart_mjd = float(reader.header["tstart"])
     sample_time_s = float(reader.header["tsamp"])
     header_to_trigger_s = (recorded_mjd - header_tstart_mjd) * 86400.0
     header_to_trigger_samples = header_to_trigger_s / sample_time_s
-    return {
+    result = {
         "trigger_recovery_status": "pass_tolerance_bounded_replay",
         "trigger_mjd_utc": recorded_mjd,
         "replayed_trigger_mjd_utc": replay["recovered_mjd"],
@@ -128,16 +219,99 @@ def audit_dsa(path: Path, trigger_entry: dict) -> dict:
         "filterbank_sample_interval_s": sample_time_s,
         "rounded_header_to_trigger_s": header_to_trigger_s,
         "rounded_header_to_trigger_samples": header_to_trigger_samples,
-        "filterbank_sample_zero_status": "blocked_missing_exact_trigger_to_sample_mapping",
         "filterbank_tstart_use": "diagnostic_only_not_an_absolute_time_authority",
-        "fit_observation_time_origin_eligible": False,
+    }
+    if time_origin is None:
+        return result | {
+            "filterbank_sample_zero_status": "blocked_missing_exact_trigger_to_sample_mapping",
+            "fit_observation_time_origin_eligible": False,
+        }
+    if time_origin.get("status") != "owner_approved_trigger_peak_anchor":
+        raise RuntimeError("DSA trigger-to-peak mapping is not owner approved")
+    if time_origin.get("rounded_tstart_allowed") is not False:
+        raise RuntimeError("rounded DSA tstart must remain forbidden")
+    if not np.isclose(
+        float(time_origin["trigger_mjd_utc"]),
+        recorded_mjd,
+        rtol=0.0,
+        atol=0.0,
+    ):
+        raise RuntimeError("DSA time-origin trigger MJD differs from trigger authority")
+    if not np.isclose(
+        float(time_origin["filterbank_peak_offset_s"]),
+        int(time_origin["filterbank_peak_sample_index"]) * sample_time_s,
+        rtol=0.0,
+        atol=1.0e-15,
+    ):
+        raise RuntimeError("DSA time-origin peak offset contradicts its sample index")
+    if accepted_reference_path is None:
+        raise RuntimeError("approved DSA peak audit requires accepted channel support")
+    observed_peak_sample = _dsa_peak_sample(reader, accepted_reference_path)
+    approved_peak_sample = int(time_origin["filterbank_peak_sample_index"])
+    if observed_peak_sample != approved_peak_sample:
+        raise RuntimeError("DSA filterbank peak sample differs from the approved anchor")
+    alternative = time_origin["alternative_pretrigger_convention"]
+    alternative_sample = int(alternative["sample_index"])
+    mapping_ambiguity_s = abs(approved_peak_sample - alternative_sample) * sample_time_s
+    if not np.isclose(
+        mapping_ambiguity_s,
+        float(time_origin["mapping_ambiguity_s"]),
+        rtol=0.0,
+        atol=1.0e-15,
+    ):
+        raise RuntimeError("DSA mapping ambiguity differs from the alternative convention")
+    trigger_reference_frequency_mhz = float(
+        time_origin["trigger_reference_frequency_mhz"]
+    )
+    product_dm_pc_cm3 = float(time_origin["filterbank_product_dm_pc_cm3"])
+    trigger_to_product_reference_s = (
+        K_DM_S_MHZ2
+        * product_dm_pc_cm3
+        * (
+            REFERENCE_FREQUENCY_MHZ**-2
+            - trigger_reference_frequency_mhz**-2
+        )
+    )
+    return result | {
+        "filterbank_sample_zero_status": "derived_from_owner_approved_trigger_peak_anchor",
+        "fit_observation_time_origin_eligible": True,
+        "joint_fit_timing_uncertainty_eligible": False,
+        "filterbank_peak_sample_index": approved_peak_sample,
+        "filterbank_peak_offset_s": float(time_origin["filterbank_peak_offset_s"]),
+        "trigger_reference_frequency_mhz": trigger_reference_frequency_mhz,
+        "filterbank_product_dm_pc_cm3": product_dm_pc_cm3,
+        "product_reference_frequency_mhz": REFERENCE_FREQUENCY_MHZ,
+        "trigger_to_product_reference_s": trigger_to_product_reference_s,
+        "alternative_pretrigger_convention": {
+            "sample_index": alternative_sample,
+            "status": alternative["status"],
+        },
+        "mapping_ambiguity_s": mapping_ambiguity_s,
+        "mapping_uncertainty_treatment": time_origin["mapping_uncertainty_treatment"],
+        "trigger_reference_frequency_status": time_origin[
+            "trigger_reference_frequency_status"
+        ],
+        "trigger_reference_frequency_sensitivity_required": time_origin[
+            "trigger_reference_frequency_sensitivity_required"
+        ],
+        "owner_approval_date": time_origin["owner_approval_date"],
+        "owner_decision_receipt_sha256": time_origin[
+            "owner_decision_receipt_sha256"
+        ],
     }
 
 
-def build_receipt(config_path: Path) -> dict:
+def build_receipt(
+    config_path: Path,
+    candidate_manifest_path: Path | None = None,
+    environment_receipt_path: Path | None = None,
+) -> dict:
     config = load_config(config_path)
     paths = {name: Path(value) for name, value in config["paths"].items()}
-    for key in ("raw_chime_h5", "raw_dsa_filterbank", "trigger_recovery"):
+    required_hashes = ["raw_chime_h5", "raw_dsa_filterbank", "trigger_recovery"]
+    if config.get("dsa", {}).get("time_origin") is not None:
+        required_hashes.append("accepted_dsa_reference")
+    for key in required_hashes:
         actual = sha256_file(paths[key])
         if actual != config["input_sha256"][key]:
             raise RuntimeError(f"{key} hash differs from configuration")
@@ -145,17 +319,50 @@ def build_receipt(config_path: Path) -> dict:
     event = config["event"]
     if event not in triggers:
         raise RuntimeError(f"trigger recovery lacks event {event}")
-    dsa = audit_dsa(paths["raw_dsa_filterbank"], triggers[event])
-    if dsa.get("fit_observation_time_origin_eligible") is not False:
-        raise RuntimeError("DSA timing must remain ineligible without sample-zero authority")
-    if dsa.get("filterbank_sample_zero_status") != (
-        "blocked_missing_exact_trigger_to_sample_mapping"
-    ):
-        raise RuntimeError("DSA sample-zero provenance hold is absent")
+    time_origin = config.get("dsa", {}).get("time_origin")
+    if time_origin is not None:
+        repo_root = Path(__file__).resolve().parents[1]
+        decision_path = repo_root / time_origin["owner_decision_receipt"]
+        if sha256_file(decision_path) != time_origin["owner_decision_receipt_sha256"]:
+            raise RuntimeError("owner decision receipt hash differs from configuration")
+        if candidate_manifest_path is None or environment_receipt_path is None:
+            raise RuntimeError("approved timing audit requires candidate and environment receipts")
+        execution_context = _verify_execution_context(
+            repo_root,
+            config_path,
+            candidate_manifest_path,
+            environment_receipt_path,
+        )
+    else:
+        execution_context = None
+    dsa = audit_dsa(
+        paths["raw_dsa_filterbank"],
+        triggers[event],
+        time_origin,
+        paths.get("accepted_dsa_reference"),
+    )
+    if time_origin is None:
+        if dsa.get("fit_observation_time_origin_eligible") is not False:
+            raise RuntimeError("DSA timing must remain ineligible without sample-zero authority")
+        if dsa.get("filterbank_sample_zero_status") != (
+            "blocked_missing_exact_trigger_to_sample_mapping"
+        ):
+            raise RuntimeError("DSA sample-zero provenance hold is absent")
+        receipt_status = "timing_replayed_fit_input_blocked"
+    else:
+        if dsa.get("fit_observation_time_origin_eligible") is not True:
+            raise RuntimeError("approved DSA trigger peak anchor was not admitted")
+        if dsa.get("filterbank_sample_zero_status") != (
+            "derived_from_owner_approved_trigger_peak_anchor"
+        ):
+            raise RuntimeError("approved DSA trigger peak anchor is absent")
+        if dsa.get("joint_fit_timing_uncertainty_eligible") is not False:
+            raise RuntimeError("pending DSA mapping treatment must block joint fitting")
+        receipt_status = "timing_replayed_fit_input_blocked_pending_mapping_decision"
     repo_root = Path(__file__).resolve().parents[1]
     return {
         "schema_version": 1,
-        "status": "timing_replayed_fit_input_blocked",
+        "status": receipt_status,
         "event": event,
         "event_binding_sha256": config["event_binding_sha256"],
         "reference_frequency_mhz": REFERENCE_FREQUENCY_MHZ,
@@ -168,18 +375,35 @@ def build_receipt(config_path: Path) -> dict:
             "raw_chime_h5_sha256": config["input_sha256"]["raw_chime_h5"],
             "raw_dsa_filterbank": str(paths["raw_dsa_filterbank"]),
             "raw_dsa_filterbank_sha256": config["input_sha256"]["raw_dsa_filterbank"],
+            "accepted_dsa_reference": str(paths.get("accepted_dsa_reference", "")),
+            "accepted_dsa_reference_sha256": config["input_sha256"].get(
+                "accepted_dsa_reference"
+            ),
             "trigger_recovery": str(paths["trigger_recovery"]),
             "trigger_recovery_sha256": config["input_sha256"]["trigger_recovery"],
+            "owner_decision_receipt": (
+                time_origin.get("owner_decision_receipt") if time_origin else None
+            ),
+            "owner_decision_receipt_sha256": (
+                time_origin.get("owner_decision_receipt_sha256") if time_origin else None
+            ),
             "script_sha256": sha256_file(Path(__file__)),
-            "repository_commit": subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
-            ).strip(),
+            "execution_context": execution_context,
         },
     }
 
 
-def publish_receipt(config_path: Path, output_path: Path) -> dict:
-    receipt = build_receipt(config_path)
+def publish_receipt(
+    config_path: Path,
+    output_path: Path,
+    candidate_manifest_path: Path | None = None,
+    environment_receipt_path: Path | None = None,
+) -> dict:
+    receipt = build_receipt(
+        config_path,
+        candidate_manifest_path,
+        environment_receipt_path,
+    )
     payload = json.dumps(receipt, indent=2, allow_nan=False) + "\n"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -206,8 +430,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--candidate-manifest", type=Path)
+    parser.add_argument("--environment-receipt", type=Path)
     args = parser.parse_args()
-    publish_receipt(args.config, args.output)
+    publish_receipt(
+        args.config,
+        args.output,
+        args.candidate_manifest,
+        args.environment_receipt,
+    )
     print(args.output)
 
 

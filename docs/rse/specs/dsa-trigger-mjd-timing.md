@@ -109,6 +109,23 @@ bind the trigger to an exact sample index through a producer receipt or an
 independently verified integer-sample construction. The rounded `tstart` header
 must not be substituted for that mapping.
 
+For Casey, the owner approved the second route on 2026-08-01. In the raw
+filterbank already dedispersed to 491.211 pc cm⁻³, the replayed band-integrated
+peak is sample 15259, or 0.500006912 s from sample zero. An unverified
+alternative pretrigger convention places an anchor at sample 15256. No
+immutable producer artifact validates that convention. Their three-sample
+difference is a 98.304 µs mapping ambiguity. It remains separate from the
+unchanged clock prior. The required discrete two-anchor sensitivity decision is
+pending; joint fitting remains blocked. This is an empirical trigger-to-peak
+binding, not recovery of the missing producer receipt.
+
+The proposed trigger epoch referral from 1530 MHz to the shared 400 MHz
+coordinate is an owner modeling convention, not a recovered producer fact. It
+requires explicit approval and a retained reference-frequency sensitivity. At
+491.211 pc cm⁻³ the proposed cold-plasma referral is +11.866546044944464 s.
+The geometry constraint remains part of the joint fit; it is not used to choose
+the anchor.
+
 ## Current caveats
 
 - isha (221113aaao): no records from its own acquisition run survive on any
@@ -139,7 +156,9 @@ origin displacement; the fit diagnostic records a nominal window gap of
 packet inherits that origin and contains no fit. Raw-only and exact-time
 diagnostic packets avoid the numeric displacement through analysis-derived
 trigger-to-peak assignments, but lack the producer mapping and contain no
-traceable fit result. The legacy fixed-DM crossmatch is unverified.
+traceable fit result. The owner-approved Casey trigger-to-peak binding above
+permits a new, separately hash-bound preparation run; it does not validate
+those historical packets. The legacy fixed-DM crossmatch is unverified.
 
 No existing Casey product supplies a formally quotable geometry-matching DM or
 geocentric 400 MHz TOA. These failures do not invalidate the relative or
