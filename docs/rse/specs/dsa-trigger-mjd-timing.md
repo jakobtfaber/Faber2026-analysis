@@ -103,6 +103,12 @@ on top of it, the uncertainty of fitting a model to the burst profile
 fitting uncertainties are typically far larger than the microsecond trigger
 floor and are quantified per analysis, not here.
 
+The recovered trigger MJD is not, by itself, the time of sample zero in a
+derived SIGPROC filterbank. A fit-ready filterbank observation must additionally
+bind the trigger to an exact sample index through a producer receipt or an
+independently verified integer-sample construction. The rounded `tstart` header
+must not be substituted for that mapping.
+
 ## Current caveats
 
 - isha (221113aaao): no records from its own acquisition run survive on any
@@ -116,21 +122,13 @@ floor and are quantified per analysis, not here.
 
 ## Source evidence and durable artifacts
 
-All under `~/Data/Faber2026/review/dsa-origin-metadata-20260727/` unless noted:
+The current trigger-time authority is
+`~/Data/Faber2026/dsa110/trigger_mjd_microsecond_recovery.json`, SHA-256
+`87852969eb41c2abfa4c6534557ad03ed4f3e16e64cf1b28bd9da35f4ff89a0e`.
+The configured h17 shared-input copy has the same hash. This JSON supplies the
+trigger MJD only; it does not supply the filterbank sample-zero mapping.
 
-- `trigger_mjd_microsecond_recovery_v3_FINAL.json` — the authoritative
-  per-burst values reproduced in the table above.
-- `SUMMARY.md` — capture provenance for the archived trigger records
-  (dsa-storage `/mnt/data/dsa110/candidates/candidates/<event>/`, h17 header
-  re-reads, h23 recovery of casey's trigger record).
-- `token-ambiguity-inrun-resolution-20260727.md` — the in-run confirmations
-  for zach (`/mnt/data/bckuph23data/dsa110/T3/2022_2_6_19_34_4/` on
-  dsa-storage) and whitney
-  (`/mnt/data/dsa110/T2/2022_3_10_1_19_25/cluster_output1646891314.cand`),
-  with the sibling rows and anchor arithmetic quoted verbatim, and the
-  exhaustive negative search for isha-era records.
-- `adversarial-review-usec-recovery.log` — independent adversarial review of
-  the reconstruction.
-- `dsastorage_capture.json`, `dsastorage_capture_raw.json`, per-burst
-  `<burst>.json` — verbatim archived trigger records and filterbank headers
-  with checksums.
+The current supporting captures are described by
+`~/Data/Faber2026/dsa110/origin-metadata/README.md`. Its `bursts/`,
+`dsastorage/`, and `h17/` subdirectories contain the retained per-burst trigger
+records and filterbank-header captures.
