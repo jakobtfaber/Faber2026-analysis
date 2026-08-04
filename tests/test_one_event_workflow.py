@@ -17,7 +17,15 @@ import inventory_absolute_dm_inputs_h17 as input_inventory  # noqa: E402
 import preflight_phase_b_workflows_h17 as phase_b_preflight  # noqa: E402
 import run_authorized_workflows_h17 as campaign_runner  # noqa: E402
 import run_one_event_absolute_dm_workflow as workflow_runner  # noqa: E402
-from fit_one_event_joint_burst import _require_locked_product_metadata  # noqa: E402
+from fit_one_event_joint_burst import (  # noqa: E402
+    _prepare_output_binding,
+    _require_locked_product_metadata,
+    _timing_variant_contract,
+    _variant_output_dir,
+)
+from fit_one_event_joint_burst import (  # noqa: E402
+    run as run_joint_fit,
+)
 from one_event_workflow import (  # noqa: E402
     STAGES,
     apply_review_decision,
@@ -141,6 +149,329 @@ def _complete_fit_resolution_lock(proposal: dict) -> dict:
     return completed
 
 
+def _dsa_timing_sensitivity_products(tmp_path: Path) -> tuple[dict, dict[str, Path]]:
+    from radio_pipeline.fitting.products import trigger_anchor_crop_time0_unix_ns
+
+    config = _config()
+    output_root = tmp_path / "casey-one-event-workflow"
+    config["paths"]["output_root"] = str(output_root)
+    config["identity"]["output_root_basename"] = output_root.name
+    config["event_binding_sha256"] = event_binding_sha256(config)
+    paths = workflow_runner._output_paths(config)
+    paths["dsa_dir"].mkdir(parents=True, exist_ok=True)
+    paths["fit_dir"].mkdir(parents=True, exist_ok=True)
+    origin = config["dsa"]["time_origin"]
+    time0_ns = trigger_anchor_crop_time0_unix_ns(
+        origin["trigger_mjd_utc"],
+        origin["filterbank_peak_sample_index"],
+        config["dsa"]["raw_crop_start_sample"],
+        config["dsa"]["native_sample_time_s"],
+        origin["filterbank_product_dm_pc_cm3"],
+        origin["trigger_reference_frequency_mhz"],
+    )
+    waterfall = np.arange(80, dtype=np.float32).reshape(4, 20)
+    payload = {
+        "waterfall": waterfall,
+        "pixel_valid": np.ones_like(waterfall, dtype=bool),
+        "frequency_mhz": np.asarray([1312.0, 1375.0, 1435.0, 1497.0]),
+        "channel_width_mhz": np.full(4, 0.030517578125),
+        "time0_unix_ns": np.asarray(time0_ns, dtype=np.int64),
+        "sample_interval_s": np.asarray(config["dsa"]["native_sample_time_s"]),
+        "product_dm_pc_cm3": np.asarray(
+            origin["filterbank_product_dm_pc_cm3"], dtype=np.float64
+        ),
+        "reference_frequency_mhz": np.asarray(400.0, dtype=np.float64),
+    }
+    np.savez_compressed(paths["dsa_fit_observation"], **payload)
+    np.savez_compressed(
+        paths["dsa_dir"] / "dsa_anchor_dm.npz",
+        **{
+            **payload,
+            "frequency_mhz": np.asarray([1311.25, 1498.75]),
+            "channel_width_mhz": np.full(2, 0.030517578125),
+        },
+    )
+    return config, paths
+
+
+def test_dsa_timing_sensitivity_materializes_exact_anchor_and_reference_arms(
+    tmp_path: Path,
+) -> None:
+    config, paths = _dsa_timing_sensitivity_products(tmp_path)
+
+    roster = workflow_runner.materialize_dsa_timing_sensitivities(config, paths=paths)
+
+    assert roster["status"] == "prepared_pending_independent_review"
+    assert roster["joint_fit_timing_eligible"] is False
+    assert roster["materializer_sha256"] == workflow_runner.sha256_file(
+        Path(workflow_runner.__file__)
+    )
+    assert roster["reference_frequency_invariance"][
+        "alternative_reference_frequency_mhz"
+    ] == 1498.75
+    assert roster["authoritative_frequency_source"]["sha256"] == (
+        workflow_runner.sha256_file(paths["dsa_dir"] / "dsa_anchor_dm.npz")
+    )
+    assert len(roster["authoritative_frequency_source"]["frequency_grid_sha256"]) == 64
+    assert roster["alternative_anchor"]["sample_index"] == 15256
+    assert roster["alternative_anchor"]["offset_from_primary_ns"] == 98_304
+    assert abs(
+        roster["reference_frequency_invariance"]["difference_from_primary_ns"]
+    ) <= 1
+    assert roster["reference_frequency_invariance"][
+        "fixed_trigger_epoch_is_diagnostic_only"
+    ] is True
+    assert paths["timing_sensitivity_pdf"].is_file()
+
+    with np.load(paths["dsa_fit_observation"], allow_pickle=False) as primary:
+        with np.load(paths["dsa_alternative_anchor_observation"], allow_pickle=False) as alternate:
+            for key in primary.files:
+                if key != "time0_unix_ns":
+                    np.testing.assert_array_equal(alternate[key], primary[key])
+            assert int(alternate["time0_unix_ns"]) - int(primary["time0_unix_ns"]) == 98_304
+        with np.load(
+            paths["dsa_reference_invariance_observation"], allow_pickle=False
+        ) as invariant:
+            for key in primary.files:
+                if key != "time0_unix_ns":
+                    np.testing.assert_array_equal(invariant[key], primary[key])
+            assert abs(int(invariant["time0_unix_ns"]) - int(primary["time0_unix_ns"])) <= 1
+
+
+def test_alternative_anchor_fit_contract_uses_only_reviewed_time_coordinate(
+    tmp_path: Path,
+) -> None:
+    config, paths = _dsa_timing_sensitivity_products(tmp_path)
+    roster = workflow_runner.materialize_dsa_timing_sensitivities(config, paths=paths)
+    with np.load(paths["dsa_fit_observation"], allow_pickle=False) as primary:
+        shape = list(primary["waterfall"].shape)
+        time0_ns = int(primary["time0_unix_ns"])
+    config["joint_fit"]["resolution"].update(
+        {
+            "dsa_fit_observation_sha256": workflow_runner.sha256_file(
+                paths["dsa_fit_observation"]
+            ),
+            "dsa_time0_unix_ns": time0_ns,
+            "dsa_time_axis_sha256": "1" * 64,
+            "dsa_sample_interval_s": config["dsa"]["native_sample_time_s"],
+            "dsa_shape": shape,
+        }
+    )
+    roster_sha256 = workflow_runner.sha256_file(paths["timing_sensitivity_roster"])
+    config["joint_fit"].setdefault("review_decision", {})[
+        "timing_sensitivity_roster_sha256"
+    ] = roster_sha256
+
+    contract = _timing_variant_contract(
+        config,
+        paths["dsa_alternative_anchor_observation"],
+        "alternative_anchor",
+        roster,
+        paths["timing_sensitivity_roster"],
+        roster_sha256,
+    )
+    assert contract["product_sha256"] == roster["alternative_anchor"]["sha256"]
+    assert contract["time0_unix_ns"] == time0_ns + 98_304
+    with pytest.raises(ValueError, match="wrong DSA observation"):
+        _timing_variant_contract(
+            config,
+            paths["dsa_fit_observation"],
+            "alternative_anchor",
+            roster,
+            paths["timing_sensitivity_roster"],
+            roster_sha256,
+        )
+
+    with pytest.raises(ValueError, match="roster differs"):
+        _timing_variant_contract(
+            config,
+            paths["dsa_alternative_anchor_observation"],
+            "alternative_anchor",
+            roster,
+            paths["timing_sensitivity_roster"],
+            "0" * 64,
+        )
+
+
+def test_timing_variant_output_and_checkpoint_binding_are_isolated(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    primary = tmp_path / "casey-one-event-workflow"
+    config["paths"]["output_root"] = str(primary)
+    alternative = tmp_path / "casey-one-event-workflow-anchor-15256-sensitivity"
+    assert _variant_output_dir(config, "primary") == primary
+    assert _variant_output_dir(config, "alternative_anchor") == alternative
+
+    binding = {
+        "event_binding_sha256": config["event_binding_sha256"],
+        "timing_variant": "alternative_anchor",
+        "dsa_observation_sha256": "1" * 64,
+        "timing_sensitivity_roster_sha256": "2" * 64,
+    }
+    _prepare_output_binding(alternative, binding)
+    assert json.loads(
+        (alternative / ".checkpoints/timing-variant.json").read_text()
+    ) == binding
+
+    changed = {**binding, "timing_variant": "primary"}
+    with pytest.raises(ValueError, match="another timing variant"):
+        _prepare_output_binding(alternative, changed)
+
+    for field in (
+        "dsa_observation_sha256",
+        "timing_sensitivity_roster_sha256",
+    ):
+        completed = tmp_path / f"completed-{field}"
+        completed.mkdir()
+        (completed / "fit-result.json").write_text(
+            json.dumps(
+                {
+                    "event_binding_sha256": binding["event_binding_sha256"],
+                    "timing_variant": binding["timing_variant"],
+                    "timing_binding": binding,
+                }
+            )
+        )
+        substituted = {**binding, field: "9" * 64}
+        with pytest.raises(ValueError, match="another timing variant"):
+            _prepare_output_binding(completed, substituted)
+
+    unbound = tmp_path / "casey-one-event-workflow-anchor-15256-sensitivity-unbound"
+    (unbound / ".checkpoints").mkdir(parents=True)
+    (unbound / ".checkpoints/sampler.pkl").write_bytes(b"untrusted")
+    with pytest.raises(ValueError, match="lacks a trusted"):
+        _prepare_output_binding(unbound, binding)
+
+
+def test_alternative_fit_rejects_primary_output_directory_before_execution(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    primary = tmp_path / "casey-one-event-workflow"
+    config["paths"]["output_root"] = str(primary)
+
+    with pytest.raises(ValueError, match="alternative_anchor fit output must be"):
+        run_joint_fit(
+            config,
+            chime_path=tmp_path / "missing-chime.npz",
+            dsa_path=tmp_path / "missing-dsa.npz",
+            geometry_path=tmp_path / "missing-geometry.json",
+            output_dir=primary,
+            repo_root=ROOT,
+            timing_variant="alternative_anchor",
+        )
+
+
+def test_dsa_timing_sensitivity_rejects_changed_primary_origin(tmp_path: Path) -> None:
+    config, paths = _dsa_timing_sensitivity_products(tmp_path)
+    with np.load(paths["dsa_fit_observation"], allow_pickle=False) as archive:
+        payload = {key: np.array(archive[key], copy=True) for key in archive.files}
+    payload["time0_unix_ns"] = payload["time0_unix_ns"] + 1
+    np.savez_compressed(paths["dsa_fit_observation"], **payload)
+
+    with pytest.raises(ValueError, match="approved anchor"):
+        workflow_runner.materialize_dsa_timing_sensitivities(config, paths=paths)
+
+    assert not paths["dsa_alternative_anchor_observation"].exists()
+    assert not paths["timing_sensitivity_roster"].exists()
+
+
+def test_dsa_timing_sensitivity_rejects_changed_authoritative_frequency(
+    tmp_path: Path,
+) -> None:
+    config, paths = _dsa_timing_sensitivity_products(tmp_path)
+    source = paths["dsa_dir"] / "dsa_anchor_dm.npz"
+    with np.load(source, allow_pickle=False) as archive:
+        payload = {key: np.array(archive[key], copy=True) for key in archive.files}
+    payload["frequency_mhz"][-1] = 1498.5
+    np.savez_compressed(source, **payload)
+
+    with pytest.raises(ValueError, match="reference-invariance frequency"):
+        workflow_runner.materialize_dsa_timing_sensitivities(config, paths=paths)
+
+    assert not paths["dsa_alternative_anchor_observation"].exists()
+    assert not paths["timing_sensitivity_roster"].exists()
+
+
+def test_dsa_timing_sensitivity_publication_fails_as_an_incomplete_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, paths = _dsa_timing_sensitivity_products(tmp_path)
+    original = workflow_runner._atomic_write_npz
+    calls = 0
+
+    def fail_second_write(path: Path, arrays: dict) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second-product failure")
+        original(path, arrays)
+
+    monkeypatch.setattr(workflow_runner, "_atomic_write_npz", fail_second_write)
+    with pytest.raises(OSError, match="injected second-product failure"):
+        workflow_runner.materialize_dsa_timing_sensitivities(config, paths=paths)
+
+    assert not paths["dsa_alternative_anchor_observation"].exists()
+    assert not paths["dsa_reference_invariance_observation"].exists()
+    assert not paths["timing_sensitivity_roster"].exists()
+    assert workflow_runner._workflow_output_set_valid(paths, config) is False
+
+
+def test_dsa_timing_sensitivity_output_validation_rejects_tampering(
+    tmp_path: Path,
+) -> None:
+    config, paths = _dsa_timing_sensitivity_products(tmp_path)
+    workflow_runner.materialize_dsa_timing_sensitivities(config, paths=paths)
+    assert workflow_runner._workflow_output_set_valid(paths, config) is True
+
+    pdf_bytes = paths["timing_sensitivity_pdf"].read_bytes()
+    paths["timing_sensitivity_pdf"].write_bytes(pdf_bytes + b"tamper")
+    assert workflow_runner._workflow_output_set_valid(paths, config) is False
+    paths["timing_sensitivity_pdf"].write_bytes(pdf_bytes)
+
+    roster = json.loads(paths["timing_sensitivity_roster"].read_text())
+    roster["alternative_anchor"]["offset_from_primary_ns"] += 1
+    paths["timing_sensitivity_roster"].write_text(json.dumps(roster))
+    assert workflow_runner._workflow_output_set_valid(paths, config) is False
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("alternate_time_origin", "invariant_reference_metadata", "source_array"),
+)
+def test_dsa_timing_sensitivity_rejects_coordinated_product_and_roster_rehash(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    config, paths = _dsa_timing_sensitivity_products(tmp_path)
+    workflow_runner.materialize_dsa_timing_sensitivities(config, paths=paths)
+    roster = json.loads(paths["timing_sensitivity_roster"].read_text())
+    if mutation == "invariant_reference_metadata":
+        product = paths["dsa_reference_invariance_observation"]
+        section = "reference_frequency_invariance"
+    else:
+        product = paths["dsa_alternative_anchor_observation"]
+        section = "alternative_anchor"
+    with np.load(product, allow_pickle=False) as archive:
+        payload = {key: np.array(archive[key], copy=True) for key in archive.files}
+    if mutation == "alternate_time_origin":
+        payload["time0_unix_ns"] += 1
+        roster[section]["time0_unix_ns"] += 1
+        roster[section]["offset_from_primary_ns"] += 1
+    elif mutation == "invariant_reference_metadata":
+        payload["trigger_reference_frequency_mhz"] = np.asarray(1498.5)
+        roster[section]["alternative_reference_frequency_mhz"] = 1498.5
+    else:
+        payload["waterfall"].flat[0] += 1
+    np.savez_compressed(product, **payload)
+    roster[section]["sha256"] = workflow_runner.sha256_file(product)
+    paths["timing_sensitivity_roster"].write_text(json.dumps(roster))
+
+    assert workflow_runner._workflow_output_set_valid(paths, config) is False
+
+
 def test_resolution_lock_binds_pixels_noise_and_time_axis(tmp_path: Path) -> None:
     paths = _resolution_products(tmp_path)
     proposal = _complete_fit_resolution_lock(
@@ -254,11 +585,13 @@ def test_ready_schema_requires_science_array_hashes(tmp_path: Path) -> None:
                 "event": "casey",
                 "source_event_binding_sha256": "1" * 64,
                 "component_proposal_sha256": "2" * 64,
-                "resolution_proposal_sha256": "3" * 64,
+                    "resolution_proposal_sha256": "3" * 64,
+                    "timing_sensitivity_roster_sha256": "9" * 64,
                 "fit_settings_sha256": "4" * 64,
                 "components_sha256": "5" * 64,
                 "associations_sha256": "6" * 64,
-                "approved_resolution_sha256": "7" * 64,
+                    "approved_resolution_sha256": "7" * 64,
+                    "timing_sensitivity_review_status": "approved",
                 "reviewer": "reviewer",
                 "review_date": "2026-07-29",
                 "note": "test",
@@ -291,8 +624,16 @@ def test_ready_schema_requires_science_array_hashes(tmp_path: Path) -> None:
         jsonschema.validate(config, schema)
 
 
+def _review_timing_roster(config: dict) -> dict:
+    path = Path(config["paths"]["output_root"]) / "timing-sensitivity-roster.json"
+    return json.loads(path.read_text())
+
+
 def _approved_transition_inputs(tmp_path: Path) -> tuple[dict, dict, dict]:
-    config = _config()
+    config, timing_paths = _dsa_timing_sensitivity_products(tmp_path / "timing")
+    timing_roster = workflow_runner.materialize_dsa_timing_sensitivities(
+        config, paths=timing_paths
+    )
     resolution = _complete_fit_resolution_lock(
         workflow_runner.resolution_lock_proposal(_resolution_products(tmp_path))
     )
@@ -340,6 +681,8 @@ def _approved_transition_inputs(tmp_path: Path) -> tuple[dict, dict, dict]:
         component_proposal_sha256="1" * 64,
         resolution_proposal=resolution,
         resolution_proposal_sha256="2" * 64,
+        timing_sensitivity_roster=timing_roster,
+        timing_sensitivity_roster_sha256="3" * 64,
     )
     template.update(
         {
@@ -369,6 +712,8 @@ def test_review_and_authorization_are_separate_bound_transitions(tmp_path: Path)
         component_proposal_sha256="1" * 64,
         resolution_proposal=resolution,
         resolution_proposal_sha256="2" * 64,
+        timing_sensitivity_roster=_review_timing_roster(config),
+        timing_sensitivity_roster_sha256="3" * 64,
     )
 
     assert config == original
@@ -421,6 +766,51 @@ def test_review_decision_rejects_source_identity_drift(tmp_path: Path) -> None:
             component_proposal_sha256="1" * 64,
             resolution_proposal=resolution,
             resolution_proposal_sha256="2" * 64,
+            timing_sensitivity_roster=_review_timing_roster(changed),
+            timing_sensitivity_roster_sha256="3" * 64,
+        )
+
+
+def test_review_decision_rejects_timing_sensitivity_roster_drift(
+    tmp_path: Path,
+) -> None:
+    config, proposal, decision = _approved_transition_inputs(tmp_path)
+    resolution = copy.deepcopy(decision["resolution_lock"])
+    resolution["status"] = "pending_owner_review"
+    resolution["crop_and_off_pulse_padding_locked"] = False
+
+    with pytest.raises(ValueError, match="timing_sensitivity_roster_sha256"):
+        apply_review_decision(
+            config,
+            decision,
+            component_proposal=proposal,
+            component_proposal_sha256="1" * 64,
+            resolution_proposal=resolution,
+            resolution_proposal_sha256="2" * 64,
+            timing_sensitivity_roster=_review_timing_roster(config),
+            timing_sensitivity_roster_sha256="4" * 64,
+        )
+
+
+def test_review_transition_rejects_timing_materializer_identity_tamper(
+    tmp_path: Path,
+) -> None:
+    config, proposal, _ = _approved_transition_inputs(tmp_path)
+    roster = _review_timing_roster(config)
+    roster["materializer_sha256"] = "0" * 64
+    resolution = _complete_fit_resolution_lock(
+        workflow_runner.resolution_lock_proposal(_resolution_products(tmp_path / "locks"))
+    )
+
+    with pytest.raises(ValueError, match="status or identity changed"):
+        build_review_decision_template(
+            config,
+            component_proposal=proposal,
+            component_proposal_sha256="1" * 64,
+            resolution_proposal=resolution,
+            resolution_proposal_sha256="2" * 64,
+            timing_sensitivity_roster=roster,
+            timing_sensitivity_roster_sha256="3" * 64,
         )
 
 
@@ -443,6 +833,8 @@ def test_review_decision_rejects_component_outside_fit_grid(
             component_proposal_sha256="1" * 64,
             resolution_proposal=resolution,
             resolution_proposal_sha256="2" * 64,
+            timing_sensitivity_roster=_review_timing_roster(config),
+            timing_sensitivity_roster_sha256="3" * 64,
         )
 
 
@@ -461,6 +853,8 @@ def test_review_decision_rejects_components_from_another_grid(tmp_path: Path) ->
             component_proposal_sha256="1" * 64,
             resolution_proposal=resolution,
             resolution_proposal_sha256="2" * 64,
+            timing_sensitivity_roster=_review_timing_roster(config),
+            timing_sensitivity_roster_sha256="3" * 64,
         )
 
 
@@ -469,6 +863,7 @@ def test_public_transition_modes_write_new_configs_only(tmp_path: Path) -> None:
     source = tmp_path / "blocked.json"
     component_path = tmp_path / "component-proposal.json"
     resolution_path = tmp_path / "resolution-lock-proposal.json"
+    timing_roster_path = tmp_path / "timing-sensitivity-roster.json"
     decision_path = tmp_path / "review-decision.json"
     reviewed_path = tmp_path / "reviewed.json"
     authorized_path = tmp_path / "authorized.json"
@@ -478,12 +873,18 @@ def test_public_transition_modes_write_new_configs_only(tmp_path: Path) -> None:
         workflow_runner.resolution_lock_proposal(_resolution_products(tmp_path / "locks"))
     )
     resolution_path.write_text(json.dumps(resolution))
+    timing_roster = _review_timing_roster(config)
+    timing_roster_path.write_text(json.dumps(timing_roster))
     decision = build_review_decision_template(
         config,
         component_proposal=proposal,
         component_proposal_sha256=workflow_runner.sha256_file(component_path),
         resolution_proposal=resolution,
         resolution_proposal_sha256=workflow_runner.sha256_file(resolution_path),
+        timing_sensitivity_roster=timing_roster,
+        timing_sensitivity_roster_sha256=workflow_runner.sha256_file(
+            timing_roster_path
+        ),
     )
     decision.update(
         {
@@ -511,6 +912,8 @@ def test_public_transition_modes_write_new_configs_only(tmp_path: Path) -> None:
             str(component_path),
             "--resolution-proposal",
             str(resolution_path),
+            "--timing-sensitivity-roster",
+            str(timing_roster_path),
             "--output-config",
             str(reviewed_path),
         ],
@@ -1208,9 +1611,8 @@ def test_preparation_mode_only_relaxes_product_builder_authorization(
             assert "--preparation-only" not in command
 
 
-def test_casey_preparation_remains_blocked_pending_mapping_decision() -> None:
-    with pytest.raises(ValueError, match="mapping sensitivity is pending owner decision"):
-        workflow_runner._require_preparation_geometry(_config())
+def test_casey_preparation_accepts_approved_mapping_and_frequency_decisions() -> None:
+    workflow_runner._require_preparation_geometry(_config())
 
 
 @pytest.mark.parametrize(
@@ -1276,8 +1678,7 @@ def test_clock_prior_remains_separate_from_mapping_ambiguity() -> None:
     _shrink_timing_prior(config["joint_fit"]["geometry"])
     config["event_binding_sha256"] = event_binding_sha256(config)
     validate_config(config)
-    with pytest.raises(ValueError, match="mapping sensitivity is pending owner decision"):
-        workflow_runner._require_preparation_geometry(config)
+    workflow_runner._require_preparation_geometry(config)
 
 
 @pytest.mark.parametrize(
@@ -1299,7 +1700,6 @@ def test_clock_prior_remains_separate_from_mapping_ambiguity() -> None:
         lambda geometry: geometry.update(
             clock_sigma_s={"chime": 0.6e-3, "dsa": 0.8e-3}
         ),
-        _shrink_timing_prior,
     ],
 )
 def test_preparation_geometry_rejects_malformed_timing_budget(mutate) -> None:

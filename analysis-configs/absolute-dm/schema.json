@@ -656,10 +656,12 @@
             "source_event_binding_sha256",
             "component_proposal_sha256",
             "resolution_proposal_sha256",
+            "timing_sensitivity_roster_sha256",
             "fit_settings_sha256",
             "components_sha256",
             "associations_sha256",
             "approved_resolution_sha256",
+            "timing_sensitivity_review_status",
             "reviewer",
             "review_date",
             "note"
@@ -670,10 +672,12 @@
             "source_event_binding_sha256": {"$ref": "#/$defs/sha256"},
             "component_proposal_sha256": {"$ref": "#/$defs/sha256"},
             "resolution_proposal_sha256": {"$ref": "#/$defs/sha256"},
+            "timing_sensitivity_roster_sha256": {"$ref": "#/$defs/sha256"},
             "fit_settings_sha256": {"$ref": "#/$defs/sha256"},
             "components_sha256": {"$ref": "#/$defs/sha256"},
             "associations_sha256": {"$ref": "#/$defs/sha256"},
             "approved_resolution_sha256": {"$ref": "#/$defs/sha256"},
+            "timing_sensitivity_review_status": {"const": "approved"},
             "reviewer": {"type": "string", "minLength": 1},
             "review_date": {"type": "string", "format": "date"},
             "note": {"type": "string", "minLength": 1}
@@ -1281,7 +1285,7 @@
         "trigger_mjd_utc": {"type": ["string", "number"]},
         "trigger_reference_frequency_mhz": {"type": "number", "exclusiveMinimum": 0},
         "trigger_reference_frequency_status": {
-          "const": "proposed_modeling_convention_pending_owner_decision"
+          "const": "owner_approved_provisional_modeling_convention"
         },
         "trigger_reference_frequency_sensitivity_required": {"const": true},
         "filterbank_product_dm_pc_cm3": {"type": "number"},
@@ -1298,7 +1302,7 @@
         },
         "mapping_ambiguity_s": {"type": "number", "minimum": 0},
         "mapping_uncertainty_treatment": {
-          "const": "pending_owner_decision_discrete_two_anchor_sensitivity"
+          "const": "owner_approved_discrete_two_anchor_sensitivity"
         },
         "rounded_tstart_allowed": {"const": false},
         "owner_approval_date": {"type": "string", "format": "date"},

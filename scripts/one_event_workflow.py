@@ -9,12 +9,14 @@ import math
 import re
 from copy import deepcopy
 from datetime import date
+from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
 REFERENCE_FREQUENCY_MHZ = 400.0
 UPCHANNEL_FACTOR = 16
+DSA_REFERENCE_INVARIANCE_MHZ = 1498.75
 EVENT_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -77,6 +79,216 @@ def sample_time_axis_ns(
         np.arange(sample_count, dtype=np.float64) * float(sample_interval_s) * 1.0e9
     ).astype(np.int64)
     return np.asarray(int(time0_unix_ns), dtype=np.int64) + offsets_ns
+
+
+def validate_timing_sensitivity_roster(
+    config: dict[str, Any],
+    roster: dict[str, Any],
+) -> None:
+    import numpy as np
+
+    def trigger_anchor_crop_time0_unix_ns(
+        trigger_mjd: object,
+        trigger_sample_index: int,
+        crop_start_sample: float,
+        sample_time_s: float,
+        product_dm_pc_cm3: float,
+        trigger_reference_frequency_mhz: float,
+    ) -> int:
+        seconds = (
+            (Decimal(str(trigger_mjd)) - Decimal("40587")) * Decimal("86400")
+            + (Decimal(str(crop_start_sample)) - Decimal(trigger_sample_index))
+            * Decimal(str(sample_time_s))
+            + Decimal("4148.808")
+            * Decimal(str(product_dm_pc_cm3))
+            * (
+                Decimal(str(REFERENCE_FREQUENCY_MHZ)) ** -2
+                - Decimal(str(trigger_reference_frequency_mhz)) ** -2
+            )
+        )
+        return int(
+            (seconds * Decimal("1000000000")).to_integral_value(
+                rounding=ROUND_HALF_EVEN
+            )
+        )
+
+    root = Path(config["paths"]["output_root"])
+    source_path = root / "products" / "fit" / "dsa-fit-observation.npz"
+    authority_path = root / "products" / "dsa" / "dsa_anchor_dm.npz"
+    alternative_path = root / "products" / "timing-sensitivity" / "dsa-anchor-sensitivity.npz"
+    invariant_path = root / "products" / "timing-sensitivity" / "dsa-reference-invariance.npz"
+    pdf_path = root / "timing-sensitivity-proposal.pdf"
+    time_origin = config["dsa"]["time_origin"]
+    expected_binding = config["joint_fit"].get("review_decision", {}).get(
+        "source_event_binding_sha256", config["event_binding_sha256"]
+    )
+    expected_materializer_sha256 = sha256_file(
+        Path(__file__).with_name("run_one_event_absolute_dm_workflow.py")
+    )
+    if (
+        roster.get("status") != "prepared_pending_independent_review"
+        or roster.get("event") != config["event"]
+        or roster.get("event_binding_sha256") != expected_binding
+        or roster.get("materializer_sha256") != expected_materializer_sha256
+        or roster.get("joint_fit_timing_eligible") is not False
+    ):
+        raise ValueError("timing sensitivity roster status or identity changed")
+    expected_files = {
+        "source_observation": ("path", source_path),
+        "authoritative_frequency_source": ("path", authority_path),
+        "alternative_anchor": ("product", alternative_path),
+        "reference_frequency_invariance": ("product", invariant_path),
+        "review_pdf": ("path", pdf_path),
+    }
+    for section, (path_key, path) in expected_files.items():
+        if roster[section][path_key] != str(path):
+            raise ValueError(f"timing sensitivity {section} path changed")
+        if roster[section]["sha256"] != sha256_file(path):
+            raise ValueError(f"timing sensitivity {section} hash changed")
+
+    with np.load(source_path, allow_pickle=False) as source_archive:
+        source = {key: np.array(source_archive[key], copy=True) for key in source_archive.files}
+    with np.load(authority_path, allow_pickle=False) as authority_archive:
+        authority_frequency = np.asarray(authority_archive["frequency_mhz"])
+        authority_width = np.asarray(authority_archive["channel_width_mhz"])
+    if (
+        roster["authoritative_frequency_source"]["frequency_grid_sha256"]
+        != arrays_sha256(authority_frequency, authority_width)
+        or abs(float(np.max(authority_frequency)) - DSA_REFERENCE_INVARIANCE_MHZ) > 1.0e-12
+    ):
+        raise ValueError("authoritative DSA sensitivity frequency grid changed")
+
+    sample_interval_s = float(config["dsa"]["native_sample_time_s"])
+    product_dm = float(time_origin["filterbank_product_dm_pc_cm3"])
+    primary_sample = int(time_origin["filterbank_peak_sample_index"])
+    alternative_sample = int(
+        time_origin["alternative_pretrigger_convention"]["sample_index"]
+    )
+    crop_start = int(config["dsa"]["raw_crop_start_sample"])
+    primary_reference_mhz = float(time_origin["trigger_reference_frequency_mhz"])
+    primary_time0_ns = trigger_anchor_crop_time0_unix_ns(
+        time_origin["trigger_mjd_utc"],
+        primary_sample,
+        crop_start,
+        sample_interval_s,
+        product_dm,
+        primary_reference_mhz,
+    )
+    alternative_time0_ns = trigger_anchor_crop_time0_unix_ns(
+        time_origin["trigger_mjd_utc"],
+        alternative_sample,
+        crop_start,
+        sample_interval_s,
+        product_dm,
+        primary_reference_mhz,
+    )
+    reference_shift_s = Decimal("4148.808") * Decimal(str(product_dm)) * (
+        Decimal(str(DSA_REFERENCE_INVARIANCE_MHZ)) ** -2
+        - Decimal(str(primary_reference_mhz)) ** -2
+    )
+    invariant_trigger_mjd = Decimal(str(time_origin["trigger_mjd_utc"])) + (
+        reference_shift_s / Decimal("86400")
+    )
+    invariant_time0_ns = trigger_anchor_crop_time0_unix_ns(
+        invariant_trigger_mjd,
+        primary_sample,
+        crop_start,
+        sample_interval_s,
+        product_dm,
+        DSA_REFERENCE_INVARIANCE_MHZ,
+    )
+    fixed_epoch_time0_ns = trigger_anchor_crop_time0_unix_ns(
+        time_origin["trigger_mjd_utc"],
+        primary_sample,
+        crop_start,
+        sample_interval_s,
+        product_dm,
+        DSA_REFERENCE_INVARIANCE_MHZ,
+    )
+    mapping_ns = alternative_time0_ns - primary_time0_ns
+    if (
+        int(source["time0_unix_ns"]) != primary_time0_ns
+        or float(source["sample_interval_s"]) != sample_interval_s
+        or float(source["reference_frequency_mhz"]) != REFERENCE_FREQUENCY_MHZ
+        or roster["primary_anchor"]
+        != {
+            "sample_index": primary_sample,
+            "time0_unix_ns": primary_time0_ns,
+            "trigger_reference_frequency_mhz": primary_reference_mhz,
+        }
+        or roster["alternative_anchor"]["sample_index"] != alternative_sample
+        or roster["alternative_anchor"]["time0_unix_ns"] != alternative_time0_ns
+        or roster["alternative_anchor"]["offset_from_primary_ns"] != mapping_ns
+        or mapping_ns
+        != int(round(float(time_origin["mapping_ambiguity_s"]) * 1_000_000_000))
+        or roster["reference_frequency_invariance"]["time0_unix_ns"]
+        != invariant_time0_ns
+        or roster["reference_frequency_invariance"]["difference_from_primary_ns"]
+        != invariant_time0_ns - primary_time0_ns
+        or roster["reference_frequency_invariance"][
+            "fixed_trigger_epoch_difference_from_primary_ns"
+        ]
+        != fixed_epoch_time0_ns - primary_time0_ns
+        or roster["reference_frequency_invariance"][
+            "alternative_reference_frequency_mhz"
+        ]
+        != DSA_REFERENCE_INVARIANCE_MHZ
+        or roster["reference_frequency_invariance"]["reparameterized_trigger_mjd_utc"]
+        != str(invariant_trigger_mjd)
+        or roster["reference_frequency_invariance"][
+            "fixed_trigger_epoch_is_diagnostic_only"
+        ]
+        is not True
+    ):
+        raise ValueError("timing sensitivity arithmetic or source metadata changed")
+
+    permitted_extras = {
+        alternative_path: {"timing_variant", "trigger_anchor_sample_index"},
+        invariant_path: {
+            "timing_variant",
+            "trigger_reference_frequency_mhz",
+            "reparameterized_trigger_mjd_utc",
+        },
+    }
+    for product_path, extras in permitted_extras.items():
+        with np.load(product_path, allow_pickle=False) as product_archive:
+            if set(product_archive.files) != set(source) | extras:
+                raise ValueError("timing sensitivity product fields changed")
+            for key, source_value in source.items():
+                if key == "time0_unix_ns":
+                    continue
+                product_value = product_archive[key]
+                equal = (
+                    np.array_equal(product_value, source_value, equal_nan=True)
+                    if source_value.dtype.kind in "fc"
+                    else np.array_equal(product_value, source_value)
+                )
+                if not equal or product_value.dtype != source_value.dtype:
+                    raise ValueError(f"timing sensitivity product changed source array {key}")
+            expected_time0 = (
+                alternative_time0_ns
+                if product_path == alternative_path
+                else invariant_time0_ns
+            )
+            if int(product_archive["time0_unix_ns"]) != expected_time0:
+                raise ValueError("timing sensitivity product time origin changed")
+            if product_path == alternative_path:
+                if (
+                    str(product_archive["timing_variant"])
+                    != "alternative_anchor_sensitivity"
+                    or int(product_archive["trigger_anchor_sample_index"])
+                    != alternative_sample
+                ):
+                    raise ValueError("alternative-anchor product metadata changed")
+            elif (
+                str(product_archive["timing_variant"])
+                != "reference_frequency_invariance"
+                or float(product_archive["trigger_reference_frequency_mhz"])
+                != DSA_REFERENCE_INVARIANCE_MHZ
+                or str(product_archive["reparameterized_trigger_mjd_utc"])
+                != str(invariant_trigger_mjd)
+            ):
+                raise ValueError("reference-invariance product metadata changed")
 
 
 def event_binding_payload(config: dict[str, Any]) -> dict[str, Any]:
@@ -213,6 +425,8 @@ def build_review_decision_template(
     component_proposal_sha256: str,
     resolution_proposal: dict[str, Any],
     resolution_proposal_sha256: str,
+    timing_sensitivity_roster: dict[str, Any],
+    timing_sensitivity_roster_sha256: str,
 ) -> dict[str, Any]:
     """Build an inert owner decision form bound to exact preparation products."""
 
@@ -228,6 +442,8 @@ def build_review_decision_template(
         raise ValueError("component proposal differs from the configured review plan")
     _require_sha256(component_proposal_sha256, "component proposal SHA-256")
     _require_sha256(resolution_proposal_sha256, "resolution proposal SHA-256")
+    _require_sha256(timing_sensitivity_roster_sha256, "timing sensitivity roster SHA-256")
+    validate_timing_sensitivity_roster(config, timing_sensitivity_roster)
     return {
         "schema_version": 1,
         "status": "pending_owner_review",
@@ -236,6 +452,7 @@ def build_review_decision_template(
         "source_event_binding_sha256": config["event_binding_sha256"],
         "component_proposal_sha256": component_proposal_sha256,
         "resolution_proposal_sha256": resolution_proposal_sha256,
+        "timing_sensitivity_roster_sha256": timing_sensitivity_roster_sha256,
         "fit_settings_sha256": fit_settings_sha256(joint_fit),
         "resolution_lock": deepcopy(resolution_proposal),
         "reviewer": "",
@@ -252,6 +469,8 @@ def apply_review_decision(
     component_proposal_sha256: str,
     resolution_proposal: dict[str, Any],
     resolution_proposal_sha256: str,
+    timing_sensitivity_roster: dict[str, Any],
+    timing_sensitivity_roster_sha256: str,
 ) -> dict[str, Any]:
     """Create a locked, reviewed, execution-disabled config."""
 
@@ -264,6 +483,7 @@ def apply_review_decision(
         "source_event_binding_sha256": config["event_binding_sha256"],
         "component_proposal_sha256": component_proposal_sha256,
         "resolution_proposal_sha256": resolution_proposal_sha256,
+        "timing_sensitivity_roster_sha256": timing_sensitivity_roster_sha256,
         "fit_settings_sha256": fit_settings_sha256(joint_fit),
     }
     for key, expected in expected_identity.items():
@@ -280,6 +500,7 @@ def apply_review_decision(
         raise ValueError("review decision date must use YYYY-MM-DD") from exc
     if component_proposal.get("event_binding_sha256") != config["event_binding_sha256"]:
         raise ValueError("component proposal belongs to another event binding")
+    validate_timing_sensitivity_roster(config, timing_sensitivity_roster)
     if component_proposal.get("review_plan") != joint_fit["review_plan"]:
         raise ValueError("component proposal differs from configured review plan")
     if component_proposal.get("status") != "proposal_pending_owner_review":
@@ -416,6 +637,7 @@ def apply_review_decision(
                 "components_sha256": _payload_sha256(reviewed_components),
                 "associations_sha256": _payload_sha256(associations),
                 "approved_resolution_sha256": _payload_sha256(approved_resolution),
+                "timing_sensitivity_review_status": "approved",
                 "reviewer": decision["reviewer"],
                 "review_date": decision["review_date"],
                 "note": decision["note"],
@@ -913,11 +1135,11 @@ def validate_config(
         ):
             raise ValueError("DSA mapping ambiguity contradicts the alternative convention")
         if time_origin["mapping_uncertainty_treatment"] != (
-            "pending_owner_decision_discrete_two_anchor_sensitivity"
+            "owner_approved_discrete_two_anchor_sensitivity"
         ):
             raise ValueError("DSA mapping uncertainty treatment is unsupported")
         if time_origin["trigger_reference_frequency_status"] != (
-            "proposed_modeling_convention_pending_owner_decision"
+            "owner_approved_provisional_modeling_convention"
         ):
             raise ValueError("DSA trigger reference-frequency status is invalid")
         if time_origin["trigger_reference_frequency_sensitivity_required"] is not True:
@@ -1184,12 +1406,18 @@ def validate_config(
                 "source_event_binding_sha256",
                 "component_proposal_sha256",
                 "resolution_proposal_sha256",
+                "timing_sensitivity_roster_sha256",
                 "fit_settings_sha256",
                 "components_sha256",
                 "associations_sha256",
                 "approved_resolution_sha256",
+                "timing_sensitivity_review_status",
             ):
-                _require_sha256(review_decision[key], f"joint_fit.review_decision.{key}")
+                if key == "timing_sensitivity_review_status":
+                    if review_decision[key] != "approved":
+                        raise ValueError("timing sensitivity review is not approved")
+                else:
+                    _require_sha256(review_decision[key], f"joint_fit.review_decision.{key}")
             if review_decision["fit_settings_sha256"] != fit_settings_sha256(joint_fit):
                 raise ValueError("reviewed fit settings changed after approval")
             for key, value in (
