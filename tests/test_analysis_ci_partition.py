@@ -1,3 +1,4 @@
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -9,7 +10,7 @@ DUALBAND_MODULE = "tests/test_permanent_dualband_workflow.py"
 INVENTORY_MODULE = "tests/test_checkout_inventory.py"
 MARKERS = (
     "not slow and not network and not external_data and "
-    "not historical_replay and not integration"
+    "not historical_replay and not integration and not notebook_surface"
 )
 
 
@@ -50,7 +51,7 @@ def test_analysis_ci_partitions_the_original_suite_exactly_once() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
     general = jobs["analysis-tests"]
-    dualband = jobs["dualband-workflow-tests"]
+    dualband = jobs["dualband-aggregate"]
     inventory = jobs["checkout-inventory-tests"]
     all_commands = "\n".join(
         command for job in jobs.values() for command in _run_commands(job)
@@ -65,23 +66,13 @@ def test_analysis_ci_partitions_the_original_suite_exactly_once() -> None:
     general_command = "\n".join(_run_commands(general))
     assert f"--ignore={DUALBAND_MODULE}" in general_command
     assert f"--ignore={INVENTORY_MODULE}" in general_command
-    assert dualband["needs"] == "dualband-aggregate"
+    assert dualband["needs"] == ["changes", "dualband-fit-cell"]
     test_step = next(
         step for step in dualband["steps"] if DUALBAND_MODULE in step.get("run", "")
     )
     assert test_step["env"]["FABER2026_DUALBAND_PUBLISHED_FIXTURE"] == (
-        "${{ runner.temp }}/dualband-published"
+        "${{ runner.temp }}/dualband-results/dualband-burst-models/synthetic"
     )
-    downloads = [
-        step
-        for step in dualband["steps"]
-        if step.get("uses", "").startswith("actions/download-artifact@")
-    ]
-    assert len(downloads) == 1
-    assert downloads[0]["with"] == {
-        "name": "dualband-aggregate-${{ github.sha }}",
-        "path": "${{ runner.temp }}/dualband-published",
-    }
 
 
 def test_analysis_ci_pytest_partitions_are_complete_and_disjoint() -> None:
@@ -114,7 +105,7 @@ def test_analysis_ci_declares_fixed_four_cell_serial_matrix() -> None:
     assert "--stage fit-cell" in matrix_commands
     assert "worker_processes" not in matrix_commands
     aggregate = jobs["dualband-aggregate"]
-    assert aggregate["needs"] == "dualband-fit-cell"
+    assert aggregate["needs"] == ["changes", "dualband-fit-cell"]
     assert "--stage aggregate" in "\n".join(_run_commands(aggregate))
     for job in (matrix, aggregate):
         assert job["permissions"] == {"contents": "read"}
@@ -122,3 +113,59 @@ def test_analysis_ci_declares_fixed_four_cell_serial_matrix() -> None:
             if isinstance(step, dict) and "uses" in step:
                 assert "@" in step["uses"]
                 assert len(step["uses"].rsplit("@", 1)[1].split()[0]) == 40
+
+
+def test_analysis_changes_use_three_routed_lanes() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    jobs = workflow["jobs"]
+    route = "\n".join(_run_commands(jobs["changes"]))
+    assert "classify_ci_changes.py" in route
+    assert "lane=$lane" in route
+    assert jobs["registry-validation"]["if"] == (
+        "needs.changes.outputs.lane == 'registry'"
+    )
+    for name in (
+        "analysis-tests",
+        "checkout-inventory-tests",
+        "dualband-fit-cell",
+        "dualband-aggregate",
+    ):
+        assert jobs[name]["if"] == "needs.changes.outputs.lane == 'full'"
+    assert jobs["analysis-quality"]["if"] == (
+        "needs.changes.outputs.lane != 'registry'"
+    )
+
+
+def test_draft_pull_requests_defer_ci_until_ready() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    jobs = workflow["jobs"]
+    assert "draft == false" in jobs["changes"]["if"]
+    assert "draft == false" in jobs["required"]["if"]
+
+
+def test_required_gate_references_only_declared_environment_variables() -> None:
+    # The gate script runs under `set -euo pipefail`, so `-u` aborts the step on
+    # the first undeclared variable. A job removed from `needs:` must also have
+    # its assertions removed: #246 dropped `dualband-workflow-tests` and its
+    # `DUALBAND_WORKFLOW` declaration but left the assertion in the registry
+    # lane, which failed that lane closed until it was removed.
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    required = workflow["jobs"]["required"]
+    for step in required["steps"]:
+        declared = set(step.get("env", {}))
+        referenced = set(re.findall(r'"\$([A-Z_][A-Z0-9_]*)"', step.get("run", "")))
+        assert referenced <= declared, (
+            f"gate references undeclared variables: {sorted(referenced - declared)}"
+        )
+
+
+def test_analysis_ci_exposes_one_stable_required_check() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    required = workflow["jobs"]["required"]
+    assert required["name"] == "analysis-ci"
+    assert required["if"].startswith("always()")
+    command = "\n".join(_run_commands(required))
+    assert 'if [ "$LANE" = full ]' in command
+    assert 'elif [ "$LANE" = quality ]' in command
+    assert 'test "$REGISTRY_VALIDATION" = success' in command
+    assert 'test "$DUALBAND_FIT" = success' in command
