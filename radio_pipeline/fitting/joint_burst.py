@@ -167,6 +167,16 @@ class BandObservation:
         self._kernel_dispersion_basis_s = K_DM_S_MHZ2 * (
             self._kernel_frequency_mhz**-2 - REFERENCE_FREQUENCY_MHZ**-2
         )
+        # The gain and kernel terms above are precomputed from these arrays;
+        # freeze them so later mutation cannot desynchronize the cached terms.
+        for array in (
+            self.waterfall,
+            self.valid,
+            self.frequency_mhz,
+            self.channel_width_mhz,
+            self.noise_std,
+        ):
+            array.setflags(write=False)
 
     @property
     def time_s(self) -> NDArray[np.floating]:

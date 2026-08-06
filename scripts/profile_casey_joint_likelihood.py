@@ -8,9 +8,9 @@ import time
 from pathlib import Path
 
 import numpy as np
-
 from fit_one_event_joint_burst import _request
 from one_event_workflow import load_config
+
 from radio_pipeline.fitting.joint_burst import (
     _component_kernels,
     _gain_marginal_band,
@@ -70,7 +70,10 @@ def main() -> None:
             )
             kernel_samples.extend(
                 _elapsed(
-                    lambda observation=observation: _component_kernels(
+                    lambda observation=observation,
+                    layout=layout,
+                    values=values,
+                    morphology=morphology: _component_kernels(
                         request, observation, layout, values, morphology
                     ),
                     args.repeats,
@@ -85,7 +88,9 @@ def main() -> None:
                 )
             )
         likelihood_samples = _elapsed(
-            lambda: _log_likelihood(theta, request, layout, morphology),
+            lambda theta=theta, layout=layout, morphology=morphology: _log_likelihood(
+                theta, request, layout, morphology
+            ),
             args.repeats,
         )
         median_seconds = statistics.median(likelihood_samples)

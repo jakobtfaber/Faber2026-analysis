@@ -125,6 +125,19 @@ def _output_paths(config: dict[str, Any]) -> dict[str, Path]:
         ),
         "timing_sensitivity_roster": root / "timing-sensitivity-roster.json",
         "timing_sensitivity_pdf": root / "timing-sensitivity-proposal.pdf",
+        "alternative_fit_dir": root.parent / f"{root.name}-anchor-15256-sensitivity",
+        "alternative_fit_result": (
+            root.parent / f"{root.name}-anchor-15256-sensitivity" / "fit-result.json"
+        ),
+        "alternative_posterior": (
+            root.parent / f"{root.name}-anchor-15256-sensitivity" / "posterior.npz"
+        ),
+        "alternative_model_products": (
+            root.parent / f"{root.name}-anchor-15256-sensitivity" / "model-products.npz"
+        ),
+        "alternative_provenance": (
+            root.parent / f"{root.name}-anchor-15256-sensitivity" / "run-provenance.json"
+        ),
         "geometry_constraint": root / "geometry-constraint.json",
         "fit_result": root / "fit-result.json",
         "posterior": root / "posterior.npz",
@@ -184,6 +197,20 @@ def _container_config(
     except ValueError:
         mount = Path("/workflow-config")
         return mount / path.name, ["-v", f"{path.parent}:{mount}:ro"]
+
+
+def alternative_anchor_fit_applicable(config: dict[str, Any]) -> bool:
+    """The sample-15256 sensitivity fit runs only for configurations that
+    declare the alternative pre-trigger convention and carry a reviewed
+    timing-sensitivity roster hash; regression fixtures and legacy configs
+    record the stage as not applicable instead of silently omitting it."""
+
+    time_origin = (config.get("dsa") or {}).get("time_origin") or {}
+    review = (config.get("joint_fit") or {}).get("review_decision") or {}
+    return (
+        "alternative_pretrigger_convention" in time_origin
+        and bool(review.get("timing_sensitivity_roster_sha256"))
+    )
 
 
 def build_stage_commands(
@@ -270,6 +297,28 @@ def build_stage_commands(
             "--output-dir",
             str(paths["root"]),
         ],
+        "alternative_anchor_fit": (
+            [
+                python,
+                str(repo_root / "scripts/fit_one_event_joint_burst.py"),
+                "--config",
+                str(config_path),
+                "--chime-observation",
+                str(paths["chime_fit_observation"]),
+                "--dsa-observation",
+                str(paths["dsa_alternative_anchor_observation"]),
+                "--geometry-constraint",
+                str(paths["geometry_constraint"]),
+                "--output-dir",
+                str(paths["alternative_fit_dir"]),
+                "--timing-variant",
+                "alternative_anchor",
+                "--timing-sensitivity-roster",
+                str(paths["timing_sensitivity_roster"]),
+            ]
+            if alternative_anchor_fit_applicable(config)
+            else None
+        ),
         "resolution_fit": [
             python,
             str(repo_root / "scripts/fit_resolution_variant.py"),
@@ -437,6 +486,15 @@ def expected_stage_outputs(
             paths["posterior"],
             paths["model_products"],
             paths["provenance"],
+        ]
+    if stage == "alternative_anchor_fit":
+        if config is not None and not alternative_anchor_fit_applicable(config):
+            return []
+        return [
+            paths["alternative_fit_result"],
+            paths["alternative_posterior"],
+            paths["alternative_model_products"],
+            paths["alternative_provenance"],
         ]
     if stage == "resolution_fit":
         return [
@@ -1113,6 +1171,13 @@ def _control_files(stage: str, repo_root: Path, config_path: Path) -> list[Path]
             repo_root / "radio_pipeline/fitting/_pulse_kernels.py",
             repo_root / "radio_pipeline/fitting/resolution.py",
         ],
+        "alternative_anchor_fit": [
+            repo_root / "scripts/fit_one_event_joint_burst.py",
+            repo_root / "radio_pipeline/fitting/joint_burst.py",
+            repo_root / "radio_pipeline/fitting/products.py",
+            repo_root / "radio_pipeline/fitting/_pulse_kernels.py",
+            repo_root / "radio_pipeline/fitting/resolution.py",
+        ],
         "resolution_fit": [
             repo_root / "scripts/materialize_joint_fit_observations.py",
             repo_root / "scripts/fit_resolution_variant.py",
@@ -1201,6 +1266,15 @@ def _stage_input_files(
             paths["dsa_fit_observation"],
             paths["chime_fit_resolution"],
             paths["dsa_fit_resolution"],
+            paths["geometry_constraint"],
+        ]
+    if stage == "alternative_anchor_fit":
+        if not alternative_anchor_fit_applicable(config):
+            return []
+        return [
+            paths["chime_fit_observation"],
+            paths["dsa_alternative_anchor_observation"],
+            paths["timing_sensitivity_roster"],
             paths["geometry_constraint"],
         ]
     if stage == "resolution_fit":
@@ -1317,6 +1391,10 @@ def _output_schema_matches(
         json_path = paths["geometry_constraint"]
     elif stage == "joint_fit":
         json_path = paths["fit_result"]
+    elif stage == "alternative_anchor_fit":
+        if not alternative_anchor_fit_applicable(config):
+            return True
+        json_path = paths["alternative_fit_result"]
     elif stage == "resolution_fit":
         json_path = paths["fine_fit_result"]
     elif stage == "resolution_check":
@@ -1396,6 +1474,12 @@ def _all_workflow_files(
             expected.add(paths[key])
     for stage in STAGES:
         expected.update(expected_stage_outputs(stage, paths, config))
+    windowed = config.get("windowed_inputs")
+    if windowed is not None:
+        for relative in windowed["prematerialized"]:
+            expected.add(paths["root"] / relative)
+        amendment = config["joint_fit"]["review_decision"]["window_amendment"]
+        expected.add(Path(amendment["path"]))
     return expected
 
 
@@ -1740,6 +1824,67 @@ def _write_manifest(
     )
 
 
+WINDOWED_RUNNABLE_STAGES = frozenset(
+    {"preflight", "geometry_constraint", "joint_fit", "alternative_anchor_fit"}
+)
+
+
+def require_windowed_stage_window(
+    config: dict[str, Any],
+    selected: list[str],
+) -> None:
+    """A windowed-inputs configuration authorizes a refit on prematerialized
+    sliced products; the product-building stages cannot be rerun from it and
+    must be requested against the source configuration instead."""
+
+    windowed = config.get("windowed_inputs")
+    if windowed is None:
+        return
+    blocked = [stage for stage in selected if stage not in WINDOWED_RUNNABLE_STAGES]
+    if blocked:
+        raise RuntimeError(
+            "windowed-inputs configuration cannot run stage(s) "
+            + ", ".join(blocked)
+            + ": its products are prematerialized slices of "
+            + str(windowed["source_output_root"])
+            + "; rerun product stages from the source configuration, or select "
+            + "stages within "
+            + ", ".join(sorted(WINDOWED_RUNNABLE_STAGES, key=STAGES.index))
+        )
+
+
+def verify_prematerialized_windowed_inputs(
+    config: dict[str, Any],
+    paths: dict[str, Path],
+) -> None:
+    """Verify every declared prematerialized product byte-for-byte before a
+    windowed refit; this replaces the product-building stages' materialization."""
+
+    windowed = config["windowed_inputs"]
+    root = paths["root"]
+    for relative, digest in windowed["prematerialized"].items():
+        product = root / relative
+        if not product.is_file():
+            raise RuntimeError(
+                f"windowed input missing: {product} (declared in windowed_inputs)"
+            )
+        actual = sha256_file(product)
+        if actual != digest:
+            raise RuntimeError(
+                f"windowed input differs from its declaration: {product} "
+                f"has SHA-256 {actual}, declared {digest}"
+            )
+    resolution = config["joint_fit"]["resolution"]
+    for instrument in ("chime", "dsa"):
+        expected = resolution[f"{instrument}_fit_observation_sha256"]
+        observation = paths[f"{instrument}_fit_observation"]
+        if sha256_file(observation) != expected:
+            raise RuntimeError(
+                f"{instrument} windowed fit observation does not match the "
+                "reviewed resolution binding"
+            )
+
+
 def execute(
     config: dict[str, Any],
     *,
@@ -1777,6 +1922,7 @@ def execute(
         }
 
     selected_stages = _stage_window(from_stage, through_stage)
+    require_windowed_stage_window(config, list(selected_stages))
     interrupted_stages = [
         stage for stage, record in state["stages"].items() if record.get("status") == "running"
     ]
@@ -1888,11 +2034,14 @@ def execute(
         _write_json(paths["state"], state)
         try:
             if stage == "joint_fit":
-                materialize_reviewed_fit_observations(
-                    config["joint_fit"]["resolution"],
-                    repo_root=repo_root,
-                    paths=paths,
-                )
+                if config.get("windowed_inputs") is not None:
+                    verify_prematerialized_windowed_inputs(config, paths)
+                else:
+                    materialize_reviewed_fit_observations(
+                        config["joint_fit"]["resolution"],
+                        repo_root=repo_root,
+                        paths=paths,
+                    )
             elif stage == "resolution_fit":
                 materialize_resolution_variant(
                     config,
@@ -1917,6 +2066,11 @@ def execute(
             _write_json(paths["state"], state)
             if stage == "preflight":
                 record["verified_inputs"] = verified_inputs
+            elif stage == "alternative_anchor_fit" and commands[stage] is None:
+                record["not_applicable_reason"] = (
+                    "configuration declares no alternative pre-trigger convention "
+                    "or no reviewed timing-sensitivity roster"
+                )
             elif stage == "packet":
                 subprocess.run(commands[stage], check=True, env=stage_environment)
             elif stage == "manifests":

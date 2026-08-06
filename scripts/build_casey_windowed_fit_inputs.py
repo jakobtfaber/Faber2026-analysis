@@ -7,13 +7,19 @@ CHIME [155:235], DSA [1299:1325] (decision record:
 amended in-session to the envelope-preserving slices). This script slices the
 approved full-window products, rebuilds the timing-sensitivity roster, and
 emits a new authorized config whose resolution block binds the windowed
-products. All hashes are computed with one_event_workflow's own functions.
-Original products, configs, and checkpoints are not touched.
+products. The config declares `windowed_inputs` (source run, windows, and the
+SHA-256 of every prematerialized product) and binds the owner's ratified
+window-decision artifact in `review_decision.window_amendment`; the workflow
+verifies the prematerialized products at joint_fit and refuses to rerun the
+product-building stages from this config. All hashes are computed with
+one_event_workflow's own functions. Original products, configs, and
+checkpoints are not touched.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from copy import deepcopy
@@ -23,13 +29,14 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from one_event_workflow import (  # noqa: E402
+    _payload_sha256,
     arrays_sha256,
     event_binding_sha256,
     load_config,
     sample_time_axis_ns,
     validate_timing_sensitivity_roster,
-    _payload_sha256,
 )
+
 from radio_pipeline.fitting.products import sha256_file  # noqa: E402
 
 EVIDENCE = Path("/data/Faber2026/evidence/dm-toa-geometry-20260801")
@@ -37,6 +44,17 @@ OLD_ROOT = EVIDENCE / "casey-one-event-workflow"
 NEW_ROOT = EVIDENCE / "casey-one-event-workflow-windowed"
 OLD_CONFIG = EVIDENCE / "casey-control/casey-authorized.json"
 NEW_CONFIG = EVIDENCE / "casey-control/casey-authorized-windowed.json"
+# Owner window ratification (2026-08-04). The artifact is copied into the
+# windowed output root and bound by hash in the review decision's
+# window_amendment block; the build refuses to run without it.
+WINDOW_DECISION = Path(
+    os.environ.get(
+        "CASEY_WINDOW_DECISION",
+        "~/Data/Faber2026/review/casey-joint-fit-inputs/"
+        "window-decision-ratified-20260804.json",
+    )
+).expanduser()
+WORKFLOW_RUNNER = Path(__file__).resolve().parent / "run_one_event_absolute_dm_workflow.py"
 
 WINDOWS = {"chime": (155, 235), "dsa": (1299, 1325)}
 DT_NS = {"chime": 81920, "dsa": 32768}
@@ -68,6 +86,11 @@ def slice_product(src: Path, dst: Path, instrument: str) -> dict:
 def main() -> None:
     if NEW_ROOT.exists() and any(NEW_ROOT.iterdir()):
         raise SystemExit(f"refusing to overwrite non-empty {NEW_ROOT}")
+    if not WINDOW_DECISION.is_file():
+        raise SystemExit(
+            f"owner window-decision artifact not found: {WINDOW_DECISION} "
+            "(set CASEY_WINDOW_DECISION to its location)"
+        )
     config = json.loads(OLD_CONFIG.read_text())
 
     sliced = {}
@@ -161,6 +184,9 @@ def main() -> None:
     )
     invariance["sha256"] = sha256_file(Path(invariance["product"]))
     roster["review_pdf"]["path"] = str(NEW_ROOT / "timing-sensitivity-proposal.pdf")
+    # The workflow's output-set validation checks the roster against the hash
+    # of the runner that will execute the windowed refit; stamp the current one.
+    roster["materializer_sha256"] = sha256_file(WORKFLOW_RUNNER)
     roster_path = NEW_ROOT / "timing-sensitivity-roster.json"
     roster_path.write_text(json.dumps(roster, indent=2) + "\n")
 
@@ -175,6 +201,44 @@ def main() -> None:
         " [155:235], DSA [1299:1325] (envelope-preserving); see"
         " window-decision-ratified-20260804.json."
     )
+    # Bind the owner's window amendment by hash. The reviewed full-window
+    # proposals stay bound via component/resolution_proposal_sha256; the
+    # amendment records exactly which reviewed proposals the windows amend.
+    amendment_dst = NEW_ROOT / WINDOW_DECISION.name
+    shutil.copy2(WINDOW_DECISION, amendment_dst)
+    review["window_amendment"] = {
+        "path": str(amendment_dst),
+        "sha256": sha256_file(amendment_dst),
+        "chime_window_samples": list(WINDOWS["chime"]),
+        "dsa_window_samples": list(WINDOWS["dsa"]),
+        "base_component_proposal_sha256": review["component_proposal_sha256"],
+        "base_resolution_proposal_sha256": review["resolution_proposal_sha256"],
+    }
+
+    # Declare the prematerialized windowed products. The workflow verifies
+    # these hashes at joint_fit instead of rebuilding, and refuses to run the
+    # product-building stages from this configuration.
+    prematerialized: dict[str, str] = {}
+    for rel in sorted(
+        {
+            *sliced.keys(),
+            "products/dsa/dsa_anchor_dm.npz",
+            "timing-sensitivity-proposal.pdf",
+            "component-proposal.json",
+            "resolution-lock-proposal.json",
+        }
+    ):
+        product = NEW_ROOT / rel
+        if product.is_file():
+            prematerialized[rel] = sha256_file(product)
+    prematerialized["timing-sensitivity-roster.json"] = sha256_file(roster_path)
+    config["windowed_inputs"] = {
+        "source_config_sha256": sha256_file(OLD_CONFIG),
+        "source_output_root": str(OLD_ROOT),
+        "chime_window_samples": list(WINDOWS["chime"]),
+        "dsa_window_samples": list(WINDOWS["dsa"]),
+        "prematerialized": prematerialized,
+    }
     authorization = joint_fit["authorization"]
     authorization["note"] += (
         " Windowed inputs rebuilt under the owner's 2026-08-04 window ratification."

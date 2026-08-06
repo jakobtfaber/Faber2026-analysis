@@ -35,6 +35,7 @@ from one_event_workflow import (  # noqa: E402
     load_config,
     validate_config,
     validate_resolution_lock,
+    validate_windowed_inputs,
 )
 from run_one_event_absolute_dm_workflow import outputs_match  # noqa: E402
 
@@ -1070,6 +1071,204 @@ def test_default_dry_run_lists_all_stages_and_writes_nothing(tmp_path: Path) -> 
     assert [row["stage"] for row in plan["stages"]] == list(STAGES)
     assert plan["writes_performed"] is False
     assert not output_root.exists()
+
+
+def test_alternative_anchor_fit_stage_follows_joint_fit() -> None:
+    assert STAGES.index("alternative_anchor_fit") == STAGES.index("joint_fit") + 1
+
+
+def test_alternative_anchor_fit_command_requires_reviewed_roster(tmp_path: Path) -> None:
+    config = _config()
+    output_root = tmp_path / "casey-output"
+    config["paths"]["output_root"] = str(output_root)
+    config["identity"]["output_root_basename"] = output_root.name
+    config_path = tmp_path / "casey-config.json"
+
+    commands = workflow_runner.build_stage_commands(
+        config,
+        config_path=config_path,
+        repo_root=ROOT,
+    )
+    assert not workflow_runner.alternative_anchor_fit_applicable(config)
+    assert commands["alternative_anchor_fit"] is None
+
+    config["joint_fit"]["review_decision"] = {
+        "timing_sensitivity_roster_sha256": "0" * 64,
+    }
+    assert workflow_runner.alternative_anchor_fit_applicable(config)
+    commands = workflow_runner.build_stage_commands(
+        config,
+        config_path=config_path,
+        repo_root=ROOT,
+    )
+    command = commands["alternative_anchor_fit"]
+    assert command is not None
+    assert "--timing-variant" in command
+    assert command[command.index("--timing-variant") + 1] == "alternative_anchor"
+    assert "--timing-sensitivity-roster" in command
+    paths = workflow_runner._output_paths(config)
+    assert (
+        command[command.index("--dsa-observation") + 1]
+        == str(paths["dsa_alternative_anchor_observation"])
+    )
+    assert (
+        command[command.index("--output-dir") + 1]
+        == str(paths["alternative_fit_dir"])
+    )
+    assert paths["alternative_fit_dir"].name == f"{output_root.name}-anchor-15256-sensitivity"
+    outputs = workflow_runner.expected_stage_outputs(
+        "alternative_anchor_fit", paths, config
+    )
+    assert outputs == [
+        paths["alternative_fit_result"],
+        paths["alternative_posterior"],
+        paths["alternative_model_products"],
+        paths["alternative_provenance"],
+    ]
+
+    del config["dsa"]["time_origin"]["alternative_pretrigger_convention"]
+    assert not workflow_runner.alternative_anchor_fit_applicable(config)
+    assert (
+        workflow_runner.expected_stage_outputs(
+            "alternative_anchor_fit", paths, config
+        )
+        == []
+    )
+
+
+def _windowed_declaration(tmp_path: Path) -> tuple[dict, dict]:
+    windowed = {
+        "source_config_sha256": "1" * 64,
+        "source_output_root": str(tmp_path / "source-root"),
+        "chime_window_samples": [155, 235],
+        "dsa_window_samples": [1299, 1325],
+        "prematerialized": {
+            "products/fit/chime-fit-observation.npz": "2" * 64,
+            "products/fit/dsa-fit-observation.npz": "3" * 64,
+        },
+    }
+    amendment = {
+        "path": str(tmp_path / "window-decision-ratified-20260804.json"),
+        "sha256": "4" * 64,
+        "chime_window_samples": [155, 235],
+        "dsa_window_samples": [1299, 1325],
+        "base_component_proposal_sha256": "5" * 64,
+        "base_resolution_proposal_sha256": "6" * 64,
+    }
+    return windowed, amendment
+
+
+def test_windowed_inputs_and_amendment_must_be_declared_together(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    windowed, amendment = _windowed_declaration(tmp_path)
+    config["windowed_inputs"] = windowed
+    with pytest.raises(ValueError, match="declared together"):
+        validate_windowed_inputs(config)
+
+    config = _config()
+    config["joint_fit"]["review_decision"] = {"window_amendment": amendment}
+    with pytest.raises(ValueError, match="declared together"):
+        validate_windowed_inputs(config)
+
+
+def test_windowed_inputs_amendment_binds_reviewed_proposals(tmp_path: Path) -> None:
+    config = _config()
+    windowed, amendment = _windowed_declaration(tmp_path)
+    config["dsa"]["crop_samples"] = 26
+    config["windowed_inputs"] = windowed
+    config["joint_fit"]["review_decision"] = {
+        "component_proposal_sha256": "5" * 64,
+        "resolution_proposal_sha256": "6" * 64,
+        "window_amendment": amendment,
+    }
+    validate_windowed_inputs(config)
+
+    config["joint_fit"]["review_decision"]["component_proposal_sha256"] = "7" * 64
+    with pytest.raises(ValueError, match="base_component_proposal_sha256"):
+        validate_windowed_inputs(config)
+
+
+def test_windowed_inputs_windows_must_match_shapes_and_crop(tmp_path: Path) -> None:
+    config = _config()
+    windowed, amendment = _windowed_declaration(tmp_path)
+    config["dsa"]["crop_samples"] = 26
+    config["windowed_inputs"] = windowed
+    config["joint_fit"]["review_decision"] = {
+        "component_proposal_sha256": "5" * 64,
+        "resolution_proposal_sha256": "6" * 64,
+        "window_amendment": amendment,
+    }
+    config["joint_fit"]["resolution"]["dsa_shape"] = [768, 27]
+    with pytest.raises(ValueError, match="dsa_shape"):
+        validate_windowed_inputs(config)
+
+    config["joint_fit"]["resolution"]["dsa_shape"] = [768, 26]
+    config["dsa"]["crop_samples"] = 27
+    with pytest.raises(ValueError, match="crop_samples"):
+        validate_windowed_inputs(config)
+
+    amendment["dsa_window_samples"] = [1299, 1326]
+    config["dsa"]["crop_samples"] = 26
+    with pytest.raises(ValueError, match="disagrees"):
+        validate_windowed_inputs(config)
+
+
+def test_windowed_config_refuses_product_building_stages(tmp_path: Path) -> None:
+    config = _config()
+    windowed, _ = _windowed_declaration(tmp_path)
+    config["windowed_inputs"] = windowed
+    with pytest.raises(RuntimeError, match="prematerialized slices"):
+        workflow_runner.require_windowed_stage_window(
+            config, ["preflight", "dsa_audit", "joint_fit"]
+        )
+    workflow_runner.require_windowed_stage_window(
+        config, ["preflight", "geometry_constraint", "joint_fit", "alternative_anchor_fit"]
+    )
+    config.pop("windowed_inputs")
+    workflow_runner.require_windowed_stage_window(config, list(STAGES))
+
+
+def test_windowed_prematerialized_products_are_hash_verified(tmp_path: Path) -> None:
+    config = _config()
+    root = tmp_path / "windowed-root"
+    config["paths"]["output_root"] = str(root)
+    product = root / "products/fit/chime-fit-observation.npz"
+    product.parent.mkdir(parents=True)
+    product.write_bytes(b"windowed")
+    dsa_product = root / "products/fit/dsa-fit-observation.npz"
+    dsa_product.write_bytes(b"windowed-dsa")
+    config["windowed_inputs"] = {
+        "source_config_sha256": "1" * 64,
+        "source_output_root": str(tmp_path / "source-root"),
+        "chime_window_samples": [155, 235],
+        "dsa_window_samples": [1299, 1325],
+        "prematerialized": {
+            "products/fit/chime-fit-observation.npz": workflow_runner.sha256_file(
+                product
+            ),
+            "products/fit/dsa-fit-observation.npz": workflow_runner.sha256_file(
+                dsa_product
+            ),
+        },
+    }
+    config["joint_fit"]["resolution"][
+        "chime_fit_observation_sha256"
+    ] = workflow_runner.sha256_file(product)
+    config["joint_fit"]["resolution"][
+        "dsa_fit_observation_sha256"
+    ] = workflow_runner.sha256_file(dsa_product)
+    paths = workflow_runner._output_paths(config)
+    workflow_runner.verify_prematerialized_windowed_inputs(config, paths)
+
+    product.write_bytes(b"tampered")
+    with pytest.raises(RuntimeError, match="differs from its declaration"):
+        workflow_runner.verify_prematerialized_windowed_inputs(config, paths)
+
+    product.unlink()
+    with pytest.raises(RuntimeError, match="windowed input missing"):
+        workflow_runner.verify_prematerialized_windowed_inputs(config, paths)
 
 
 def test_casey_execution_fails_before_inputs_while_joint_review_is_blocked() -> None:

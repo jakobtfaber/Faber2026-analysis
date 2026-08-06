@@ -103,3 +103,12 @@ parameter-dependent slow-path fraction; and correct the wall-time projection
 for measured pool efficiency rather than assuming perfect 16-worker scaling.
 Cached observation arrays must also remain immutable. The independent review is
 repeated at the frozen candidate hash.
+
+## Companion diagnostic notebook
+
+The exploratory notebook `casey-fit-input-diagnostic.ipynb` is not tracked:
+repository policy (config/grandfathered-notebooks.txt) freezes the set of
+tracked notebooks. It is preserved at Git tag
+`rescue/casey-fit-performance-recovery` (path
+`docs/analysis/casey-fit-input-diagnostic.ipynb`) and, for live work, belongs
+under `~/Data/Faber2026/workbench/` per docs/rse/ops/live-analysis.md.

@@ -139,7 +139,7 @@
     "crop_samples": 2500,
     "padding_samples": 64,
     "audit_sample_rows": 96,
-    "native_sample_time_s": 0.000032768,
+    "native_sample_time_s": 3.2768e-05,
     "time_origin": {
       "status": "owner_approved_trigger_peak_anchor",
       "trigger_mjd_utc": "60369.37095221912",
@@ -153,7 +153,7 @@
         "sample_index": 15256,
         "status": "unverified_alternative_for_sensitivity_only"
       },
-      "mapping_ambiguity_s": 0.000098304,
+      "mapping_ambiguity_s": 9.8304e-05,
       "mapping_uncertainty_treatment": "owner_approved_discrete_two_anchor_sensitivity",
       "rounded_tstart_allowed": false,
       "owner_approval_date": "2026-08-01",
@@ -169,7 +169,7 @@
     "gates": {
       "direct_correlation_min": 0.9,
       "reversed_correlation_max": 0.1,
-      "reference_minus_raw_dm_abs_max_pc_cm3": 0.000001,
+      "reference_minus_raw_dm_abs_max_pc_cm3": 1e-06,
       "edge_fail_closed": true
     }
   },
@@ -192,8 +192,8 @@
       "source_icrs": "11h19m56.05s +70d40m34.4s",
       "epoch_mjd_utc": "60369.37095221912",
       "site_delay_sigma_s": {
-        "chime": 5e-7,
-        "dsa": 5e-7
+        "chime": 5e-07,
+        "dsa": 5e-07
       },
       "clock_sigma_s": {
         "chime": 0.0007071067811865475,
@@ -208,7 +208,7 @@
         "absolute_utc_calibration_status": "not_independently_measured",
         "owner_adoption_date": "2026-07-29"
       },
-      "maximum_projection_disagreement_s": 5e-7
+      "maximum_projection_disagreement_s": 5e-07
     },
     "resolution": {
       "status": "pending_owner_review",
@@ -308,6 +308,7 @@
       "dsa_products",
       "geometry_constraint",
       "joint_fit",
+      "alternative_anchor_fit",
       "resolution_fit",
       "resolution_check",
       "chime_oracle",
@@ -317,5 +318,5 @@
       "manifests"
     ]
   },
-  "event_binding_sha256": "84e2a9b338a144da926c344982829464f353440a641b9e134dd04bbbc0ddea38"
+  "event_binding_sha256": "5ac2371b10b12802a67df2000045e2f8ca1f36d442829f9546b2720e33617d7c"
 }

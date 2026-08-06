@@ -27,6 +27,7 @@ STAGES = (
     "dsa_products",
     "geometry_constraint",
     "joint_fit",
+    "alternative_anchor_fit",
     "resolution_fit",
     "resolution_check",
     "chime_oracle",
@@ -856,6 +857,117 @@ def _path_mentions_event(value: str, event: str) -> bool:
     return event in tokens
 
 
+def validate_windowed_inputs(config: dict[str, Any]) -> None:
+    """Fail closed on a windowed-inputs declaration that does not bind its
+    prematerialized products and its owner window amendment exactly.
+
+    A configuration carrying ``windowed_inputs`` authorizes a refit on
+    prematerialized sliced products; the product-building stages cannot be
+    rerun from it. The declaration must therefore identify the source
+    configuration, the exact windows, and the SHA-256 of every prematerialized
+    product, and the review decision must bind the owner's window-amendment
+    artifact rather than describing it in free text.
+    """
+
+    windowed = config.get("windowed_inputs")
+    review_decision = (config.get("joint_fit") or {}).get("review_decision") or {}
+    amendment = review_decision.get("window_amendment")
+    if windowed is None and amendment is None:
+        return
+    if windowed is None or amendment is None:
+        raise ValueError(
+            "windowed_inputs and joint_fit.review_decision.window_amendment "
+            "must be declared together"
+        )
+    _require_keys(
+        windowed,
+        (
+            "source_config_sha256",
+            "source_output_root",
+            "chime_window_samples",
+            "dsa_window_samples",
+            "prematerialized",
+        ),
+        "windowed_inputs",
+    )
+    _require_sha256(
+        windowed["source_config_sha256"], "windowed_inputs.source_config_sha256"
+    )
+    source_root = windowed["source_output_root"]
+    if not isinstance(source_root, str) or not Path(source_root).is_absolute():
+        raise ValueError("windowed_inputs.source_output_root must be an absolute path")
+    windows: dict[str, tuple[int, int]] = {}
+    for instrument in ("chime", "dsa"):
+        window = windowed[f"{instrument}_window_samples"]
+        if (
+            not isinstance(window, list)
+            or len(window) != 2
+            or not all(isinstance(edge, int) for edge in window)
+            or not 0 <= window[0] < window[1]
+        ):
+            raise ValueError(
+                f"windowed_inputs.{instrument}_window_samples must be [start, stop] "
+                "with 0 <= start < stop"
+            )
+        windows[instrument] = (window[0], window[1])
+    prematerialized = windowed["prematerialized"]
+    if not isinstance(prematerialized, dict) or not prematerialized:
+        raise ValueError(
+            "windowed_inputs.prematerialized must map product paths to SHA-256"
+        )
+    for relative, digest in prematerialized.items():
+        if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+            raise ValueError(
+                "windowed_inputs.prematerialized keys must be output-root-relative paths"
+            )
+        _require_sha256(digest, f"windowed_inputs.prematerialized[{relative}]")
+    resolution = (config.get("joint_fit") or {}).get("resolution") or {}
+    for instrument in ("chime", "dsa"):
+        start, stop = windows[instrument]
+        shape = resolution.get(f"{instrument}_shape")
+        if shape is not None and int(shape[1]) != stop - start:
+            raise ValueError(
+                f"joint_fit.resolution.{instrument}_shape does not match the "
+                f"declared {instrument} window length {stop - start}"
+            )
+    dsa_start, dsa_stop = windows["dsa"]
+    if int(config["dsa"]["crop_samples"]) != dsa_stop - dsa_start:
+        raise ValueError(
+            "dsa.crop_samples does not match the declared DSA window length"
+        )
+    _require_keys(
+        amendment,
+        (
+            "path",
+            "sha256",
+            "chime_window_samples",
+            "dsa_window_samples",
+            "base_component_proposal_sha256",
+            "base_resolution_proposal_sha256",
+        ),
+        "joint_fit.review_decision.window_amendment",
+    )
+    _require_sha256(
+        amendment["sha256"], "joint_fit.review_decision.window_amendment.sha256"
+    )
+    if not isinstance(amendment["path"], str) or not amendment["path"]:
+        raise ValueError("window_amendment.path must be a non-empty path")
+    for instrument in ("chime", "dsa"):
+        if list(amendment[f"{instrument}_window_samples"]) != list(
+            windowed[f"{instrument}_window_samples"]
+        ):
+            raise ValueError(
+                f"window_amendment.{instrument}_window_samples disagrees with "
+                "windowed_inputs"
+            )
+    for key in ("component_proposal_sha256", "resolution_proposal_sha256"):
+        if amendment[f"base_{key}"] != review_decision.get(key):
+            raise ValueError(
+                f"window_amendment.base_{key} must equal the reviewed {key}: the "
+                "amendment applies to the reviewed full-window proposals"
+            )
+
+
 def validate_config(
     config: dict[str, Any],
     *,
@@ -1474,6 +1586,8 @@ def validate_config(
             raise ValueError("joint_fit status is invalid")
         elif not blockers or joint_fit["execution_authorized"] is not False:
             raise ValueError("blocked joint fit needs blockers and disabled execution")
+
+    validate_windowed_inputs(config)
 
     workflow = config["workflow"]
     _require_keys(
